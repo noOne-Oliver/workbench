@@ -580,6 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var bootStartedAt = Date()
     private var probing = false
     private var loaded = false
+    private var shotOK = false
 
     // MARK: 生命周期
 
@@ -640,8 +641,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         window.setFrameAutosaveName(ShellConst.autosaveName)
         if !restored { window.center() }
 
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if envValue("WB_SHELL_SHOT") != nil {
+            // 截图模式：只要窗口被渲染，不抢焦点、不激活，自动化跑的时候不打扰人。
+            window.orderFrontRegardless()
+        } else {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     private func buildMenu() {
@@ -831,6 +837,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     // MARK: WKNavigationDelegate
+
+    /// WB_SHELL_SHOT=/path/out.png：加载完页面后截图存档再退出。
+    /// 这是"人到底看到什么"的证据通道 —— 不依赖系统录屏权限，也不需要肉眼看窗口。
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard loaded, let shotPath = envValue("WB_SHELL_SHOT") else { return }
+        // 前端是 fetch 完再渲染的，给它一点时间把卡片画出来
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.captureScreenshot(to: shotPath)
+        }
+    }
+
+    private func captureScreenshot(to path: String) {
+        // 先问一句"页面到底画出来没有"：DOM 是可断言的，像素只能靠人眼。
+        let probe = "JSON.stringify({cards:document.querySelectorAll('.card').length, nodes:document.querySelectorAll('*').length, text:(document.body.innerText||'').slice(0,160)})"
+        webView.evaluateJavaScript(probe) { [weak self] result, error in
+            guard let self else { return }
+            if let error {
+                print("dom=fail \(error.localizedDescription)")
+            } else {
+                print("dom=\(result ?? "nil")")
+            }
+            self.snapshotTo(path: path)
+        }
+    }
+
+    private func snapshotTo(path: String) {
+        let cfg = WKSnapshotConfiguration()
+        cfg.rect = webView.bounds
+        webView.takeSnapshot(with: cfg) { [weak self] image, error in
+            guard let self else { return }
+            let finish: (Int32) -> Never = { code in
+                self.kernel?.stopChild(reason: "screenshot done")
+                exit(code)
+            }
+            if let error {
+                print("shot=fail \(error.localizedDescription)")
+                finish(2)
+            }
+            guard let image, let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]) else {
+                print("shot=fail 截图无法编码为 PNG")
+                finish(2)
+            }
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                try png.write(to: url)
+                self.shotOK = true
+                print("shot=ok path=\(url.path) bytes=\(png.count) size=\(Int(image.size.width))x\(Int(image.size.height))")
+                finish(0)
+            } catch {
+                print("shot=fail 写入失败：\(error.localizedDescription)")
+                finish(2)
+            }
+        }
+    }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         guard loaded else { return }

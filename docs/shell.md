@@ -75,6 +75,21 @@ WB_PORT=7401 WB_SHELL_SMOKE=1 dist/Workbench.app/Contents/MacOS/Workbench
 kernel=fail 端口 7399 已被其他服务占用，但它不是工作台内核（GET /api/tasks → HTTP 404：响应不是工作台内核的 JSON ...）
 ```
 
+## 证据截图（WB_SHELL_SHOT=/path/out.png）
+
+人到底看到什么，是这套东西最容易被糊弄的一环（"窗口开了"≠"页面画出来了"）。所以外壳自带一条截图通道：
+
+```bash
+WB_SHELL_SHOT=docs/shell-shot.png dist/Workbench.app/Contents/MacOS/Workbench
+# dom={"cards":3,"nodes":235,"text":"评审收件箱\n我是 \n更新于 22:48:13\n待我裁决..."}
+# shot=ok path=/Users/liujie/Deepseek/docs/shell-shot.png bytes=214438 size=1446x894
+```
+
+- 先 `evaluateJavaScript` 拿一条 **DOM 断言**（卡片数 / 节点数 / 正文前 160 字），这是可以进 CI 的东西；
+- 再 `WKWebView.takeSnapshot` 存 PNG，用 `NSBitmapImageRep` 编码，不需要系统录屏权限（TCC）；
+- 退出码 0 = 页面真渲染了；2 = 截图或写盘失败，并打印原因；
+- 这不抢焦点（`orderFrontRegardless`，不激活 app），所以能在自动化里跑。
+
 ## 环境变量
 
 | 变量 | 默认 | 作用 |
@@ -84,6 +99,7 @@ kernel=fail 端口 7399 已被其他服务占用，但它不是工作台内核�
 | `WB_TOKEN` | 空 | 设了会把 token 带进页面 query，交给 `web/app.js` |
 | `WB_NODE` | 空 | 指定 node 可执行文件（默认 PATH、/opt/homebrew/bin、nvm、volta 等） |
 | `WB_SHELL_SMOKE` | 空 | `1` = 无头自检模式 |
+| `WB_SHELL_SHOT` | 空 | 设成 PNG 路径 = 加载页面后截图并存盘，然后退出 |
 
 内核侧由外壳固定注入：`WB_ROOT=<仓库根>`、`WB_DB=<仓库根>/data/ledger.db`（和 CLI 默认一致）。
 

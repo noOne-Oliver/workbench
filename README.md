@@ -16,7 +16,7 @@ npm run serve                # 打开 http://127.0.0.1:7317 审阅
 
 默认引擎是 `mock`（确定性假引擎，用来验证流水线与护栏），不需要任何 API key、不花钱。
 
-![评审收件箱](docs/screenshot.png)
+![评审收件箱](docs/shell-shot.png)
 
 ## 它凭什么能无人值守
 
@@ -148,7 +148,14 @@ open -a "$PWD/dist/Workbench.app"
 
 # 无头自检：定位仓库 → attach 或起内核 → 请求 /api/tasks → 打印 kernel=ok tasks=<n>
 WB_SHELL_SMOKE=1 dist/Workbench.app/Contents/MacOS/Workbench
+
+# 证据截图：加载页面 → 打印 DOM 断言（卡片数/正文）→ 存 PNG → 退出
+WB_SHELL_SHOT=docs/shell-shot.png dist/Workbench.app/Contents/MacOS/Workbench
+# dom={"cards":3,...}
+# shot=ok path=/.../docs/shell-shot.png bytes=214438 size=1446x894
 ```
+
+上面这张图就是这条命令在真 app 里抓下来的，不是浏览器截图：**窗口真的把收件箱画出来了**（DOM 断言 3 张卡片、正文含任务标题与预算），像素统计 2827 种颜色、三栏亮区分明。
 
 边界：内核没打包进 app、本机得有 node，所以现在是 **launcher 而不是可分发安装包**；ad-hoc 签名只能本机跑（无公证、无 App Sandbox）。详见 [docs/shell.md](docs/shell.md)。
 
