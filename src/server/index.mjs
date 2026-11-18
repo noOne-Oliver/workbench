@@ -49,7 +49,7 @@ export function createApp(db) {
         if (!b.title || !b.repo) return json(res, 400, { error: "title 与 repo 必填" });
         const t = createTask(db, {
           title: b.title, repo: b.repo, owner: b.owner || "unknown",
-          budgetTokens: Number(b.budgetTokens || 200000),
+          budgetTokens: Number(b.budgetTokens || process.env.WB_BUDGET || 1_000_000),
         });
         return json(res, 201, { task: t });
       }

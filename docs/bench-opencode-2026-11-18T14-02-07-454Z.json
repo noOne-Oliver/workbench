@@ -1,0 +1,56 @@
+{
+  "summary": {
+    "engine": "opencode",
+    "model": "gptagent/deepseek-v4.1-flash",
+    "at": "2026-11-18T14:02:07.454Z",
+    "wallSeconds": 311,
+    "tasks": 3,
+    "reachedHuman": 3,
+    "blocked": 0,
+    "successRate": 1,
+    "totalTokens": 1249813,
+    "avgSeconds": 207,
+    "retries": 0
+  },
+  "rows": [
+    {
+      "id": "t_mwm6qj150rqer",
+      "key": "slugify",
+      "state": "awaiting_human",
+      "attempts": 1,
+      "spent": 410511,
+      "budget": 600000,
+      "seconds": 110,
+      "verified": true,
+      "guardFails": "",
+      "lastError": "",
+      "title": "实现 src/slug.mjs 导出 slugify(s)：小写、非字母数字转 -、去首尾 -、连续 - 压成一个"
+    },
+    {
+      "id": "t_mwm6qj161s9i4",
+      "key": "pow",
+      "state": "awaiting_human",
+      "attempts": 1,
+      "spent": 362124,
+      "budget": 600000,
+      "seconds": 201,
+      "verified": true,
+      "guardFails": "",
+      "lastError": "",
+      "title": "给 src/calc.mjs 增加 pow(a, b)，并在 test/calc.test.mjs 补对应测试"
+    },
+    {
+      "id": "t_mwm6qj162qc0g",
+      "key": "divzero",
+      "state": "awaiting_human",
+      "attempts": 1,
+      "spent": 477178,
+      "budget": 600000,
+      "seconds": 311,
+      "verified": true,
+      "guardFails": "",
+      "lastError": "",
+      "title": "修 bug：calc(1, 0, '/') 现在返回 Infinity，应抛 Error('divide by zero')，并补测试"
+    }
+  ]
+}

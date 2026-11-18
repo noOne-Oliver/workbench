@@ -82,7 +82,7 @@ function ensureRepo() {
 const engineName = process.env.WB_ENGINE || "mock";
 const model = process.env.WB_MODEL || "";
 const limit = Number(arg("tasks", SUITE.length));
-const budget = Number(arg("budget", 200000));
+const budget = Number(arg("budget", process.env.WB_BUDGET || 1_000_000));
 
 if (process.argv.includes("--fresh")) {
   for (const f of [DB, DB + "-wal", DB + "-shm"]) try { rmSync(f); } catch {}

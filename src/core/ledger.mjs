@@ -33,7 +33,7 @@ export function record(db, { taskId = null, type, actor = "system", payload = {}
   return ev;
 }
 
-export function createTask(db, { title, repo, owner = "unknown", budgetTokens = 200_000, baseSha = null, branch = null }) {
+export function createTask(db, { title, repo, owner = "unknown", budgetTokens = 1_000_000, baseSha = null, branch = null }) {
   if (!title || !repo) throw new Error("title 与 repo 必填");
   const id = newId();
   record(db, {

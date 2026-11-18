@@ -71,6 +71,7 @@ npm test                                           # 内核测试（状态机/�
 | `WB_MOCK_SCENARIO` | `fakegreen` | mock 场景：`fakegreen` 第一轮故意刷绿、`good` 一次过 |
 | `WB_MODEL` | 空 | opencode 用的模型 |
 | `WB_OC_HOME` | `./.oc` | opencode 的 XDG 数据目录（见下节：它必须能写，否则直接崩） |
+| `WB_BUDGET` | `1000000` | 单任务 token 预算；真引擎一个任务约 36–48 万，20 万会中途熔断 |
 
 ## 五条验收怎么复现
 
@@ -105,9 +106,26 @@ WB_ENGINE=opencode WB_MODEL=<provider/model> node scripts/bench.mjs --fresh --ta
 
 基准用的是独立种子仓库 `.bench/repo`（不是 `sandbox/demo`），所以跑来跑去不会污染演示数据。
 
-**当前状态（诚实版）**：opencode 的免费额度已耗尽（`Free usage limit reached`），本机也没有任何模型 API key，
-`codex` 的 npm 包 vendor 二进制缺失（`spawn ... ENOENT`）。所以真引擎基准还没跑出数字，
-但管道已经能正确地把它判成 `blocked` 并停在那儿等人，而不是假装在干活。
+### 实测基准（2026-11-18，gpt-agent.cc + deepseek-v4.1-flash）
+
+```
+任务                       状态             尝试  token      秒  校验
+slugify    awaiting_human      1   410511   110 pass
+pow        awaiting_human      1   362124   201 pass
+divzero    awaiting_human      1   477178   311 pass
+
+成功率 1  到达人工审核 3/3  重试 0  总 token 1249813  墙钟 311s
+```
+
+三件事值得记住：
+
+1. **一次过**：3/3 第一轮就过护栏 + Verifier，0 次重试，没有伪绿。照妖镜这次没被触发（不是没生效，是模型没作弊）。
+2. **单任务 ≈ 36–48 万 token**（约 100 秒）。这是真引擎的成本量级，不是提示词里能省掉的：opencode 每次调用自带 2 万 token 的系统提示 + 工具往返。
+   所以默认预算从 20 万提到了 **100 万**（`WB_BUDGET`）——20 万是 mock 时代的数，真任务会在跑到一半时熔断。
+3. **Verifier 确实在判内容，不在判格式**：它自己上抛了「`pow` 的测试与实现同为 `Math.pow`，属同义反复」、
+   「`calc(0,0,'/')` 现在也抛错，但数学上是 NaN」、「非 ASCII 字母会被当分隔符」——这三条都不是测试能测出来的。
+
+人工闭环也验过：approve → `merging` → `git merge --no-ff` → `done`，demo 仓库出现合并提交 `wb: merge 实现 src/slug.mjs ...`。
 
 ## v0 不做什么（故意的）
 

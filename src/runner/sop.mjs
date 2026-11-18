@@ -16,11 +16,12 @@ const RULES = [
   "~~~",
 ].join("\n");
 
-export function leadPrompt(task) {
+export function leadPrompt(task, repoPath) {
   return [RULES, "",
     "## 角色：Lead（拆解者，不写码）",
     "任务标题：" + task.title,
-    "目标仓库：" + task.repo,
+    "目标仓库：" + task.repo + (repoPath ? "（绝对路径 " + repoPath + "，只读参考）" : ""),
+    "你现在的工作目录是临时目录：不要在这里写实现，也不要写仓库；只输出拆解结果。",
     "",
     "把任务拆成 1-3 个可独立验证的切片，按依赖顺序排列。",
     "每个切片必须能用一条测试命令判定成败。",
@@ -28,10 +29,12 @@ export function leadPrompt(task) {
   ].join("\n");
 }
 
-export function architectPrompt(task, slices) {
+export function architectPrompt(task, slices, repoPath) {
   return [RULES, "",
     "## 角色：Architect（定边界，不写码）",
     "任务：" + task.title,
+    (repoPath ? "目标仓库（只读参考）：" + repoPath : ""),
+    "当前目录是临时目录：不要写实现。",
     "", "切片清单：", slices, "",
     "产出一页以内的技术方案，必须包含：模块边界、对外接口签名、失败模式、回滚方式。",
     "不确定的地方标 [待确认]，不要编造。",

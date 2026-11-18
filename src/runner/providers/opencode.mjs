@@ -46,7 +46,9 @@ export default async function createOpencode(opts = {}) {
 function execOpencode(args, cwd, { timeoutMs, idleMs, home, model }) {
   return new Promise((resolve) => {
     const env = {
+      ...readProviderEnv(home),     // 本地凭据（.oc/private/provider.env，不进仓库）
       ...process.env,
+      XDG_CONFIG_HOME: path.join(home, "config"),   // 自定义 provider 的 opencode.json 放这儿
       XDG_DATA_HOME: path.join(home, "data"),
       XDG_CACHE_HOME: path.join(home, "cache"),
       XDG_STATE_HOME: path.join(home, "state"),
@@ -186,9 +188,27 @@ function parseEvents(raw) {
     const cand = [part.text, ev.text, ev.content, part.content];
     for (const t of cand) if (typeof t === "string" && t) text += t;
     const u = ev.usage || part.tokens;
-    if (u) tokens += (u.input_tokens || u.input || 0) + (u.output_tokens || u.output || 0);
+    if (u) {
+      const total = u.total || ((u.input_tokens || u.input || 0) + (u.output_tokens || u.output || 0));
+      tokens += total;
+    }
   }
   return { text, tokens };
+}
+
+/** 本机凭据只从 .oc/private/provider.env 读，绝不进仓库；已存在的环境变量优先。 */
+function readProviderEnv(home) {
+  const file = path.join(home, "private/provider.env");
+  const out = {};
+  try {
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+      if (m) out[m[1]] = m[2];
+    }
+  } catch {
+    // 没有本地凭据就是没有，交给引擎自己报错
+  }
+  return out;
 }
 
 function estimate(s) { return s ? Math.max(1, Math.ceil(String(s).length / 4)) : 0; }

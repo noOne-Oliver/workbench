@@ -7,12 +7,14 @@ import { sh, ensureWorktree, commitAll, diffStat, diffPatch, headSha, isGitRepo 
 import { loadRepoConfig, runGuards } from "./guards.mjs";
 import * as sop from "./sop.mjs";
 import { resolve, join } from "node:path";
+import { mkdirSync } from "node:fs";
 
 import { BUILTIN_ENGINES } from "./providers/index.mjs";
 export { BUILTIN_ENGINES };
 
 export const ROOT = resolve(process.env.WB_ROOT || process.cwd());
 const WORKTREES = resolve(ROOT, "worktrees");
+const SCRATCH = resolve(ROOT, ".oc/scratch");
 const MAX_ATTEMPTS = Number(process.env.WB_MAX_ATTEMPTS || 3);
 const PAUSED = new Set(["awaiting_human", "done", "blocked", "failed"]);
 
@@ -85,10 +87,19 @@ async function callAgent(db, id, ctx, { role, prompt, attempt }) {
   }
 }
 
+/** 规划阶段的沙箱：真引擎会真的写文件，绝不能让 lead/architect 以仓库根为 cwd。 */
+function scratchFor(id) {
+  const d = join(SCRATCH, id);
+  mkdirSync(d, { recursive: true });
+  return d;
+}
+
 async function doPlanning(db, id, ctx) {
   const t = getTask(db, id);
-  const lead = await callAgent(db, id, { ...ctx, cwd: ROOT }, { role: "lead", prompt: sop.leadPrompt(t) });
-  const arch = await callAgent(db, id, { ...ctx, cwd: ROOT }, { role: "architect", prompt: sop.architectPrompt(t, lead.text) });
+  const dir = scratchFor(id);
+  const repoAbs = resolve(ROOT, t.repo);
+  const lead = await callAgent(db, id, { ...ctx, cwd: dir }, { role: "lead", prompt: sop.leadPrompt(t, repoAbs) });
+  const arch = await callAgent(db, id, { ...ctx, cwd: dir }, { role: "architect", prompt: sop.architectPrompt(t, lead.text, repoAbs) });
   record(db, { taskId: id, type: "plan.produced", actor: "architect", payload: { plan_md: arch.text } });
   record(db, { taskId: id, type: "slices.produced", actor: "lead", payload: { slices: lead.text } });
   transition(db, id, "implementing", { actor: ctx.workerId, reason: "plan ready" });

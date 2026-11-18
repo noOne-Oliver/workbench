@@ -24,7 +24,7 @@ async function main() {
       title: arg("title"),
       repo: arg("repo", "sandbox/demo"),
       owner: arg("owner", process.env.USER || "unknown"),
-      budgetTokens: Number(arg("budget", 200000)),
+      budgetTokens: Number(arg("budget", process.env.WB_BUDGET || 1_000_000)),
     });
     process.stdout.write(t.id + "\n");
     return;
