@@ -74,6 +74,12 @@ export function createApp(db) {
           payload: { decision: decision === "approve" ? "approved" : "rejected", note: b.note || null, by: b.by || t.owner },
         });
         if (b.note) addEvidence(db, t.id, { last_human_note: b.note }, "evidence.patch");
+        if (decision === "reject") {
+          record(db, {
+            taskId: t.id, type: "attempt.reset", actor: b.by || t.owner,
+            payload: { reason: "human 打回：重试额度归零，上一轮证据留给 coder" },
+          });
+        }
         transition(db, t.id, decision === "approve" ? "merging" : "queued", { actor: b.by || t.owner, reason: "human " + decision });
         return json(res, 200, { task: getTask(db, t.id) });
       }

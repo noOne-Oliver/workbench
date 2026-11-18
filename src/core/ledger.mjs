@@ -168,6 +168,11 @@ export function applyEvent(db, ev) {
     case "attempt.started":
       db.prepare("UPDATE tasks SET attempts = attempts + 1, updated_at=? WHERE id=?").run(ev.ts, ev.task_id);
       break;
+    // 人打回是"重新开局"，不该吃掉机器人的重试额度。
+    // 不重置的话，人 reject 两次就能把 attempts 顶到 MAX_ATTEMPTS，机器直接 blocked —— 人明明刚让它重做。
+    case "attempt.reset":
+      db.prepare("UPDATE tasks SET attempts = 0, updated_at=? WHERE id=?").run(ev.ts, ev.task_id);
+      break;
     case "human.decision":
       db.prepare("UPDATE tasks SET decision=?, decision_note=?, updated_at=? WHERE id=?")
         .run(p.decision, p.note ?? null, ev.ts, ev.task_id);

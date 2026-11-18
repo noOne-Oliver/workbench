@@ -131,3 +131,15 @@ test("护栏：伪绿（削弱既有测试）被判 fail，正常加强判 pass"
   assert.equal(chk(good, "no_test_weakening").ok, true);
   assert.equal(good.ok, true, "正当加强应整体通过");
 });
+// 人打回 = 重新开局，不该吃掉机器人的重试额度。
+// 否则人 reject 两次就把 attempts 顶到 MAX_ATTEMPTS，机器直接 blocked —— 人明明刚让它重做。
+test("人打回不吃机器重试额度（attempts 归零）", () => {
+  const db = freshDb();
+  const { id } = createTask(db, { title: "x", repo: "/tmp/r", owner: "a" });
+  record(db, { taskId: id, type: "attempt.started", actor: "w", payload: { attempt: 0 } });
+  record(db, { taskId: id, type: "attempt.started", actor: "w", payload: { attempt: 1 } });
+  assert.equal(getTask(db, id).attempts, 2);
+  record(db, { taskId: id, type: "attempt.reset", actor: "a", payload: { reason: "human reject" } });
+  assert.equal(getTask(db, id).attempts, 0, "人 reject 后应允许机器重新跑满 MAX_ATTEMPTS");
+});
+
