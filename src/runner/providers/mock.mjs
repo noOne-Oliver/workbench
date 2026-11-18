@@ -77,6 +77,8 @@ export default async function createMock() {
         return { ok: true, tokens: est(plan), text: plan };
       }
       if (role === "coder") {
+        const d = Number(process.env.WB_MOCK_DELAY || 0);
+        if (d > 0) await new Promise((r) => setTimeout(r, d));
         if (sc === "fakegreen" && attempt === 0) {
           write(cwd, "src/calc.mjs", "export function calc(a, b, op) { return 0; }\n");
           write(cwd, "test/calc.test.mjs", FAKE_TEST);

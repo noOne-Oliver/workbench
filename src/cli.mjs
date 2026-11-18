@@ -3,6 +3,8 @@ import { openDb } from "./core/db.mjs";
 import { createTask, getTask, listTasks, rebuild } from "./core/ledger.mjs";
 import { readForTask } from "./core/events.mjs";
 import { getProvider, listProviders } from "./runner/engine.mjs";
+import { hostname } from "node:os";
+import { BUILTIN_ENGINES } from "./runner/providers/index.mjs";
 
 function arg(name, def) {
   const i = process.argv.indexOf("--" + name);
@@ -14,7 +16,7 @@ const cmd = process.argv[2];
 async function main() {
   const db = openDb();
   if (cmd === "init") {
-    process.stdout.write("账本就绪: data/ledger.db\n引擎: " + listProviders().join(", ") + "\n");
+    process.stdout.write("账本就绪: data/ledger.db\n引擎: " + BUILTIN_ENGINES.join(", ") + "\n");
     return;
   }
   if (cmd === "enqueue") {
@@ -50,7 +52,7 @@ async function main() {
   if (cmd === "run") {
     const { pump } = await import("./runner/worker.mjs");
     const provider = await getProvider(process.env.WB_ENGINE || "mock");
-    await pump(db, { workerId: arg("worker", "cli-" + process.pid), provider, once: process.argv.includes("--once") });
+    await pump(db, { workerId: arg("worker", hostname() + ":" + process.pid), provider, once: process.argv.includes("--once") });
     return;
   }
   if (cmd === "serve") {

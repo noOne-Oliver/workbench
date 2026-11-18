@@ -1,18 +1,15 @@
 import { openDb } from "../core/db.mjs";
 import { getTask, listTasks, transition, record, spendBudget, addEvidence, overBudget } from "../core/ledger.mjs";
-import { acquire, renew, release, reclaimExpired } from "../core/lease.mjs";
+import { acquire, renew, release, reclaimExpired, reclaimDead } from "../core/lease.mjs";
+import { hostname } from "node:os";
 import { getProvider } from "./engine.mjs";
 import { sh, ensureWorktree, commitAll, diffStat, diffPatch, headSha, isGitRepo } from "./worktree.mjs";
 import { loadRepoConfig, runGuards } from "./guards.mjs";
 import * as sop from "./sop.mjs";
 import { resolve, join } from "node:path";
 
-import createMock from "./providers/mock.mjs";
-import createOpencode from "./providers/opencode.mjs";
-import { registerProvider } from "./engine.mjs";
-
-registerProvider("mock", createMock);
-registerProvider("opencode", createOpencode);
+import { BUILTIN_ENGINES } from "./providers/index.mjs";
+export { BUILTIN_ENGINES };
 
 export const ROOT = resolve(process.env.WB_ROOT || process.cwd());
 const WORKTREES = resolve(ROOT, "worktrees");
@@ -52,6 +49,7 @@ export async function runTask(db, id, ctx) {
     } catch (e) {
       const cur = getTask(db, id);
       addEvidence(db, id, { last_error: String(e && e.message || e), at: new Date().toISOString() }, "evidence.patch");
+      if (cur && cur.state === "blocked") return cur; // 熔断后的状态不许被 catch 重新拉回队列
       if (cur && cur.attempts >= MAX_ATTEMPTS) {
         transition(db, id, "blocked", { actor: workerId, reason: "error: " + (e && e.message) });
       } else {
@@ -63,7 +61,7 @@ export async function runTask(db, id, ctx) {
   return getTask(db, id);
 }
 
-async function callAgent(db, id, ctx, { role, prompt }) {
+async function callAgent(db, id, ctx, { role, prompt, attempt }) {
   const t = getTask(db, id);
   if (overBudget(t)) {
     transition(db, id, "blocked", { actor: ctx.workerId, reason: "budget exhausted" });
@@ -72,7 +70,8 @@ async function callAgent(db, id, ctx, { role, prompt }) {
   const timer = setInterval(() => renew(db, id, ctx.workerId, 300000), 60000);
   if (timer.unref) timer.unref();
   try {
-    const res = await ctx.provider.run({ role, prompt, cwd: ctx.cwd, task: t, attempt: t.attempts });
+    const zeroBased = attempt === undefined ? Math.max(0, t.attempts - 1) : attempt;
+    const res = await ctx.provider.run({ role, prompt, cwd: ctx.cwd, task: t, attempt: zeroBased });
     if (res && res.tokens) spendBudget(db, id, res.tokens, { role });
     if (!res || !res.ok) throw new Error((role + " 调用失败: ") + (res && res.error || "unknown"));
     return res;
@@ -106,13 +105,26 @@ async function doImplement(db, id, ctx) {
   const wt = ensureWorktree({ repo, dir, branch, base });
   if (!wt.ok) throw new Error("worktree 失败: " + wt.error);
 
-  record(db, { taskId: id, type: "attempt.started", actor: ctx.workerId, payload: { attempt: t.attempts } });
+  // 崩溃续跑：上一次 attempt 没有产出 impl（进程被 kill -9），就不该白烧一次重试额度
+  const inflight = hasInflightAttempt(db, id);
+  const tries = db.prepare("SELECT COUNT(*) AS n FROM events WHERE task_id=? AND type IN ('attempt.started','attempt.resumed')").get(id).n;
+  if (tries >= MAX_ATTEMPTS * 3) {
+    transition(db, id, "blocked", { actor: ctx.workerId, reason: "too many retries (incl. crash resumes)" });
+    return;
+  }
+  record(db, {
+    taskId: id,
+    type: inflight ? "attempt.resumed" : "attempt.started",
+    actor: ctx.workerId,
+    payload: inflight ? { attempt: t.attempts - 1, reason: "resumed after crash" } : { attempt: t.attempts },
+  });
   t = getTask(db, id);
   const attempt = t.attempts - 1;
 
   await callAgent(db, id, { ...ctx, cwd: dir }, {
     role: "coder",
     prompt: sop.coderPrompt(t, t.plan_md || "", attempt),
+    attempt,
   });
 
   const c = commitAll(dir, "wb: " + t.title + " (attempt " + (attempt + 1) + ")");
@@ -153,6 +165,7 @@ async function doVerify(db, id, ctx) {
       guardsFailed: guards.failed,
       testCmd: guards.testCmd,
       testOutputTail: guards.testOutput.slice(-3000),
+      diff: String(diff || "").slice(0, 12000),
       verdict: v,
       at: new Date().toISOString(),
     },
@@ -187,6 +200,13 @@ async function doReview(db, id, ctx) {
   transition(db, id, "awaiting_human", { actor: ctx.workerId, reason: "ready for human" });
 }
 
+/** 上一次 attempt.started 之后没有 impl.produced，说明那次尝试没跑完（通常是崩溃）。 */
+function hasInflightAttempt(db, id) {
+  const s = db.prepare("SELECT COALESCE(MAX(id),0) AS i FROM events WHERE task_id=? AND type='attempt.started'").get(id).i;
+  const c = db.prepare("SELECT COALESCE(MAX(id),0) AS i FROM events WHERE task_id=? AND type='impl.produced'").get(id).i;
+  return s > c;
+}
+
 async function doMerge(db, id, ctx) {
   const t = getTask(db, id);
   const repo = resolve(ROOT, t.repo);
@@ -204,6 +224,7 @@ async function doMerge(db, id, ctx) {
 /** 主泵：认领 -> 跑到暂停点 -> 释放租约。可被 kill -9，重启后从状态机续跑。 */
 export async function pump(db, { workerId, provider, once = false, idleMs = 1500, onTask } = {}) {
   for (;;) {
+    reclaimDead(db);
     reclaimExpired(db);
     const cand = pickRunnable(db);
     if (!cand) {
@@ -224,7 +245,7 @@ export async function pump(db, { workerId, provider, once = false, idleMs = 1500
 
 async function main() {
   const db = openDb();
-  const workerId = process.env.WB_WORKER_ID || ("worker-" + process.pid);
+  const workerId = process.env.WB_WORKER_ID || (hostname() + ":" + process.pid);
   const engineName = process.env.WB_ENGINE || "mock";
   const provider = await getProvider(engineName);
   process.stdout.write("[worker] " + workerId + " engine=" + engineName + " root=" + ROOT + "\n");

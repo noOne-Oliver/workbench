@@ -15,6 +15,20 @@ const el = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 let tasks = [];
+let ME = localStorage.getItem("wb_me") || "liujie";
+
+function diffBlock(diff) {
+  const lines = String(diff).split("\n");
+  const shown = lines.slice(0, 400).map((ln) => {
+    const cls = ln.startsWith("+++") || ln.startsWith("---") ? "f"
+      : ln.startsWith("+") ? "a"
+      : ln.startsWith("-") ? "d"
+      : ln.startsWith("@@") ? "h" : "";
+    return '<span class="dl ' + cls + '">' + esc(ln) + "</span>";
+  }).join("");
+  const more = lines.length > 400 ? '<span class="dl h">… 还有 ' + (lines.length - 400) + " 行</span>" : "";
+  return shown + more;
+}
 
 async function load() {
   try {
@@ -46,8 +60,11 @@ function card(t, actionable) {
     (v.verdict ? "<div class=\"row\">Verifier: <span class=\"badge " + (v.passed ? "ok" : "bad") + '">' + esc(v.verdict.summary || "") + "</span></div>" : "") +
     (checks ? '<details><summary>机器护栏 (' + (v.guards || []).filter((c) => c.ok).length + "/" + (v.guards || []).length + ')</summary><ul class="checks">' + checks + "</ul></details>" : "") +
     (raised ? '<div class="row">初审上抛：</div><ul class="raised">' + raised + "</ul>" : "") +
+    (v.diff ? '<details open><summary>改动 diff</summary><pre class="diff">' + diffBlock(v.diff) + "</pre></details>" : "") +
     (v.testOutputTail ? '<details><summary>测试输出</summary><pre>' + esc(v.testOutputTail) + "</pre></details>" : "") +
     (ev.last_error ? '<div class="row" style="color:var(--bad)">最近错误: ' + esc(ev.last_error) + "</div>" : "") +
+    (actionable && t.owner && ME !== t.owner ?
+      '<div class="row" style="color:var(--warn)">这个任务归 ' + esc(t.owner) + ' 裁决，当前身份是 ' + esc(ME) + "（右上角可改）</div>" : "") +
     (actionable ?
       '<textarea id="note-' + t.id + '" placeholder="批注（reject 时建议写清哪里不对）"></textarea>' +
       '<div class="actions">' +
@@ -76,12 +93,22 @@ window.decide = async function (id, decision) {
   const note = (document.getElementById("note-" + id) || {}).value || "";
   const r = await api("/api/tasks/" + id + "/decision", {
     method: "POST",
-    body: JSON.stringify({ decision, note, by: "liujie" }),
+    body: JSON.stringify({ decision, note, by: ME }),
   });
   const j = await r.json();
   if (!r.ok) alert(j.error || "操作失败");
   await load();
 };
+
+const meInput = el("me");
+if (meInput) {
+  meInput.value = ME;
+  meInput.addEventListener("change", () => {
+    ME = meInput.value.trim() || "liujie";
+    localStorage.setItem("wb_me", ME);
+    load();
+  });
+}
 
 load();
 setInterval(load, 2500);
