@@ -33,6 +33,18 @@ export function ensureWorktree({ repo, dir, branch, base }) {
   return { ok: true, created: true, dir };
 }
 
+/**
+ * 重试前把 worktree 拉回基线。
+ * 不这么做的话，第二次尝试看到的还是上一次已经写好的代码 —— coder 会"发现活已经干完了"，
+ * 产出与上一轮逐字节相同的 diff，护栏照样不过，白烧一整轮 token（真实基准里就是这么翻车的）。
+ */
+export function resetToBase(dir, base) {
+  const r = sh("git", ["-C", dir, "reset", "--hard", base]);
+  if (!r.ok) return { ok: false, error: r.out };
+  const c = sh("git", ["-C", dir, "clean", "-fdq"]);
+  return { ok: c.ok, error: c.ok ? "" : c.out };
+}
+
 export function removeWorktree({ repo, dir }) {
   sh("git", ["-C", repo, "worktree", "remove", "--force", dir]);
   if (existsSync(dir)) { try { rmSync(dir, { recursive: true, force: true }); } catch {} }

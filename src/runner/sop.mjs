@@ -41,15 +41,17 @@ export function architectPrompt(task, slices, repoPath) {
   ].join("\n");
 }
 
-export function coderPrompt(task, plan, attempt) {
-  return [RULES, "",
+export function coderPrompt(task, plan, attempt, feedback) {
+  const lines = [RULES, "",
     "## 角色：Coder（只实现，不自评）",
     "任务：" + task.title,
     "第 " + (attempt + 1) + " 次尝试。",
     "", "## 方案", plan, "",
     "在仓库里完成实现，并补上覆盖该实现的测试。改完自测通过即可。",
-    "不要修改既有测试文件来迁就实现。",
-  ].join("\n");
+    "不要修改既有测试文件来迁就实现。"];
+  // 重试必须带上"上一轮为什么没过"，否则就是无脑重试：同样的错会被原样再犯一次。
+  if (feedback) lines.push("", "## 上一轮为什么没过（这次必须改掉）", String(feedback));
+  return lines.join("\n");
 }
 
 /** 刻意不传 plan 里的 Coder 过程，只给 diff 与真实命令输出。 */

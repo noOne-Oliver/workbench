@@ -20,17 +20,27 @@ npm run serve                # 打开 http://127.0.0.1:7317 审阅
 
 ## 它凭什么能无人值守
 
-四个「不信任模型」的设计，缺一个就会退化成值班员：
+五个「不信任模型」的设计，缺一个就会退化成值班员：
 
 | 机制 | 解决的问题 | 落点 |
 | --- | --- | --- |
 | **事件账本**（events 唯一真源，tasks 是物化投影） | 重启失忆、状态对不上 | `src/core/ledger.mjs` 的 `rebuild()`，kill -9 后从事件重放 |
 | **租约**（单条 CAS UPDATE + pid 存活探测） | 两个 worker 抢同一个任务、死进程占着不放 | `src/core/lease.mjs` |
-| **确定性护栏**（跑真测试、比对测试用例/断言数、diff 规模） | agent 改测试刷绿、空断言、顺手重构半个仓库 | `src/runner/guards.mjs` |
+| **确定性护栏**（跑真测试、比对测试用例/断言数、查同义反复测试、diff 规模） | agent 改测试刷绿、空断言、**把实现抄成期望值**、顺手重构半个仓库 | `src/runner/guards.mjs` |
 | **角色分离**（Verifier 拿不到 coder 的内心独白，只给 diff+真实测试输出+护栏结论） | 自己批自己的作业 | `src/runner/sop.mjs` |
 
-「测试跑绿 ≠ 改对了」这件事，是护栏里的 `no_test_weakening` 兜住的，不是模型自评。
-伪绿会被自动打回重做，重试到上限才升级给人。
+「测试跑绿 ≠ 改对了」这件事，是护栏里的 `no_test_weakening` 与 `no_tautological_test` 兜住的，不是模型自评：
+
+- **削弱测试**：删文件、用例数/断言数变少 → 打回。
+- **同义反复**：实现是 `return Math.pow(a,b)`，测试写 `assert.equal(pow(2,0.5), Math.pow(2,0.5))` —— 永远绿，因为它校验的是"实现等于实现"。
+  这条是真实基准跑出来的：Verifier 靠判断发现了它，现在下沉成确定性检查（`src/runner/guards.mjs` 的 `tautologyIn`），不再依赖模型有没有注意到。
+
+伪绿会被自动打回重做，重试到上限才升级给人。重试这条路踩过两个坑，都已经堵上：
+
+- **不喂证据 = 无脑重试**：现在把上一轮失败的护栏 id、证据原文、Verifier 上抛点一起写进 Coder 的提示词（`retryFeedback`）。
+- **不重置 worktree = 假装重试**：第二次进入 `implementing` 时先 `git reset --hard` 回基线（`resetToBase`）。
+  不重置的话 Coder 看到的是上一轮已经写好的代码，会"发现活干完了"，产出逐字节相同的 diff，白烧一整轮 token——真实基准里就是这么翻的车。
+- **预算要给验证留钱**：实现花 18 万写完、账上没钱再跑 Verifier，等于把钱和活一起扔掉。现在进实现前先检查余量（`reserveShort`，默认留 25% 或 15 万 token）。
 
 ## 状态机
 
@@ -49,7 +59,7 @@ queued → planning → implementing → verifying → reviewing → awaiting_hu
 
 ```bash
 node src/cli.mjs init                              # 建库 + 建 demo 仓库
-node src/cli.mjs enqueue --title "..." --repo <dir> [--owner <name>] [--budget 200000]
+node src/cli.mjs enqueue --title "..." --repo <dir> [--owner <name>] [--budget 1000000]
 node src/cli.mjs status [--id <task>]              # 看任务与事件流
 node src/cli.mjs rebuild                           # 从事件全量重建投影（自愈）
 node src/cli.mjs run [--once] [--worker host:pid]  # 跑 worker

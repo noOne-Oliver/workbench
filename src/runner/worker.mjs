@@ -3,7 +3,7 @@ import { getTask, listTasks, transition, record, spendBudget, addEvidence, overB
 import { acquire, renew, release, reclaimExpired, reclaimDead } from "../core/lease.mjs";
 import { hostname } from "node:os";
 import { getProvider } from "./engine.mjs";
-import { sh, ensureWorktree, commitAll, diffStat, diffPatch, headSha, isGitRepo } from "./worktree.mjs";
+import { sh, ensureWorktree, resetToBase, commitAll, diffStat, diffPatch, headSha, isGitRepo } from "./worktree.mjs";
 import { loadRepoConfig, runGuards } from "./guards.mjs";
 import * as sop from "./sop.mjs";
 import { resolve, join } from "node:path";
@@ -105,6 +105,42 @@ async function doPlanning(db, id, ctx) {
   transition(db, id, "implementing", { actor: ctx.workerId, reason: "plan ready" });
 }
 
+/**
+ * 预算里必须给"验证"留出余量。
+ * 真实基准里翻过的车：实现花了 18 万 token 写完，账上没钱再跑一轮 Verifier，
+ * 于是整个任务 blocked —— 那一轮实现的钱白花，人还得手动加预算重来。
+ * 所以进入实现之前就检查：剩余预算够不够"再实现一次 + 验证一次"。
+ */
+export function reserveShort(task, ratio) {
+  const budget = Number((task && task.budget_tokens) || 0);
+  const spent = Number((task && task.spent_tokens) || 0);
+  if (!budget) return "";
+  const need = Math.max(budget * (ratio === undefined ? Number(process.env.WB_VERIFY_RESERVE || 0.25) : ratio), 150000);
+  const left = budget - spent;
+  if (left >= need) return "";
+  return "预算不足：剩 " + left + "，实现+验证至少还要 " + Math.round(need) + "；加预算或人工接手";
+}
+
+/** 把上一轮验证失败的证据压成一段话，喂给重试的 Coder。没有失败则返回空串。 */
+export function retryFeedback(task) {
+  const v = (task && task.evidence && task.evidence.verify) || null;
+  if (!v) return "";
+  const failed = (v.guards || []).filter((c) => !c.ok);
+  const lines = [];
+  if (failed.length) {
+    lines.push("机器护栏判定失败（这些是确定的，不是建议）：");
+    for (const c of failed) lines.push("- " + c.id + "：" + c.detail);
+  }
+  const verdict = v.verdict || null;
+  if (verdict && verdict.verdict === "fail" && verdict.summary) {
+    lines.push("独立 Verifier 的结论：" + verdict.summary);
+  }
+  if (verdict && Array.isArray(verdict.raised) && verdict.raised.length) {
+    lines.push("需要一并处理的点：" + verdict.raised.join("；"));
+  }
+  return lines.join("\n");
+}
+
 async function doImplement(db, id, ctx) {
   let t = getTask(db, id);
   const repo = resolve(ROOT, t.repo);
@@ -123,6 +159,20 @@ async function doImplement(db, id, ctx) {
 
   // 崩溃续跑：上一次 attempt 没有产出 impl（进程被 kill -9），就不该白烧一次重试额度
   const inflight = hasInflightAttempt(db, id);
+
+  // 真重试（不是崩溃续跑）必须从基线重来：否则 coder 看到的是上一轮已经写好的代码，
+  // 会"发现活已干完"并产出逐字节相同的 diff，护栏照样不过 —— 白烧一整轮。
+  if (!inflight && t.attempts > 0) {
+    const reset = resetToBase(dir, base);
+    if (!reset.ok) throw new Error("重置 worktree 到基线失败: " + reset.error);
+  }
+
+  // 预算要留出验证的钱：实现跑完却没钱验证，等于把上一轮的钱一起扔掉。
+  const low = reserveShort(t);
+  if (low) {
+    transition(db, id, "blocked", { actor: ctx.workerId, reason: low });
+    return;
+  }
   const tries = db.prepare("SELECT COUNT(*) AS n FROM events WHERE task_id=? AND type IN ('attempt.started','attempt.resumed')").get(id).n;
   if (tries >= MAX_ATTEMPTS * 3) {
     transition(db, id, "blocked", { actor: ctx.workerId, reason: "too many retries (incl. crash resumes)" });
@@ -139,7 +189,7 @@ async function doImplement(db, id, ctx) {
 
   await callAgent(db, id, { ...ctx, cwd: dir }, {
     role: "coder",
-    prompt: sop.coderPrompt(t, t.plan_md || "", attempt),
+    prompt: sop.coderPrompt(t, t.plan_md || "", attempt, retryFeedback(t)),
     attempt,
   });
 
