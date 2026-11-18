@@ -1,0 +1,18 @@
+{
+  "name": "workbench",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "AI 团队分工编程、人只 review 的工作台（v0 内核）",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "init": "node src/cli.mjs init",
+    "serve": "node src/server/index.mjs",
+    "worker": "node src/runner/worker.mjs",
+    "enqueue": "node src/cli.mjs enqueue",
+    "status": "node src/cli.mjs status",
+    "check": "node --test tests/"
+  }
+}

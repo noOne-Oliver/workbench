@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>工作台 · 评审收件箱</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>评审收件箱</h1>
+    <div class="meta"><span id="clock"></span></div>
+  </header>
+  <main>
+    <section id="queue" class="col">
+      <h2>待我裁决 <span id="n-await" class="pill">0</span></h2>
+      <div id="awaiting" class="cards"></div>
+    </section>
+    <section id="inflight" class="col">
+      <h2>后台在跑 <span id="n-run" class="pill">0</span></h2>
+      <div id="running" class="cards"></div>
+    </section>
+    <section id="archive" class="col">
+      <h2>归档 <span id="n-done" class="pill">0</span></h2>
+      <div id="done" class="cards"></div>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
