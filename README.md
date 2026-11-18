@@ -137,6 +137,21 @@ divzero    awaiting_human      1   477178   311 pass
 
 人工闭环也验过：approve → `merging` → `git merge --no-ff` → `done`，demo 仓库出现合并提交 `wb: merge 实现 src/slug.mjs ...`。
 
+## 桌面外壳（方案 2）
+
+`apps/macshell/` 用 Swift + AppKit + WKWebView 把上面那个三栏收件箱装进一个原生窗口，**界面逻辑一行没改**。
+外壳只做两件事：把 `http://127.0.0.1:7317/` 装进窗口，以及管内核进程的生命周期——已经在跑就直接 attach（不抢端口、不动别人的进程），没在跑就 `node src/server/index.mjs` 起一个，退出时只收自己起的那个。默认 1200×800，⌘R 刷新、⌘O 打开数据目录、⌘Q 退出。
+
+```bash
+bash apps/macshell/build.sh              # swiftc 编译 + 组装 + ad-hoc 签名 → dist/Workbench.app
+open -a "$PWD/dist/Workbench.app"
+
+# 无头自检：定位仓库 → attach 或起内核 → 请求 /api/tasks → 打印 kernel=ok tasks=<n>
+WB_SHELL_SMOKE=1 dist/Workbench.app/Contents/MacOS/Workbench
+```
+
+边界：内核没打包进 app、本机得有 node，所以现在是 **launcher 而不是可分发安装包**；ad-hoc 签名只能本机跑（无公证、无 App Sandbox）。详见 [docs/shell.md](docs/shell.md)。
+
 ## v0 不做什么（故意的）
 
 - 不做多人实时协作（多租户 = 5 倍工作量）；多人场景先用「一台 Mac 当 runner + 内网 + 单 token」，owner 绑唯一 reviewer。
@@ -153,4 +168,5 @@ web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
 scripts/      demo 重置、引擎体检（engine-smoke）、真引擎基准（bench）
+apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView，方案 2 第一步）
 ```
