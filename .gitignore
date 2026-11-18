@@ -1,5 +1,7 @@
 data/
 worktrees/
 sandbox/
+.bench/
+.oc/
 *.log
 .DS_Store

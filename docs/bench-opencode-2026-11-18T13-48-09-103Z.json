@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "engine": "opencode",
+    "model": "opencode/mimo-v2.6-flash-free",
+    "at": "2026-11-18T13:48:09.102Z",
+    "wallSeconds": 13,
+    "tasks": 1,
+    "reachedHuman": 0,
+    "blocked": 1,
+    "successRate": 0,
+    "totalTokens": 0,
+    "avgSeconds": 13,
+    "retries": 0
+  },
+  "rows": [
+    {
+      "id": "t_mwm6eycx08j2e",
+      "key": "slugify",
+      "state": "blocked",
+      "attempts": 0,
+      "spent": 0,
+      "budget": 200000,
+      "seconds": 13,
+      "verified": false,
+      "guardFails": "",
+      "lastError": "lead 调用失败: 引擎报错: Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go",
+      "title": "实现 src/slug.mjs 导出 slugify(s)：小写、非字母数字转 -、去首尾 -、连续 - 压成一个"
+    }
+  ]
+}

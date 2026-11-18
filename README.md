@@ -70,6 +70,7 @@ npm test                                           # 内核测试（状态机/�
 | `WB_MOCK_DELAY` | `0` | mock 每步延迟，用来模拟慢任务/演示并发 |
 | `WB_MOCK_SCENARIO` | `fakegreen` | mock 场景：`fakegreen` 第一轮故意刷绿、`good` 一次过 |
 | `WB_MODEL` | 空 | opencode 用的模型 |
+| `WB_OC_HOME` | `./.oc` | opencode 的 XDG 数据目录（见下节：它必须能写，否则直接崩） |
 
 ## 五条验收怎么复现
 
@@ -78,6 +79,35 @@ npm test                                           # 内核测试（状态机/�
 3. **kill -9 自愈**：跑 `npm run worker` 中途 `kill -9`，再跑 `node src/cli.mjs run --once`，任务从断点续跑且不重复烧重试额度（事件流会出现 `attempt.resumed`）。
 4. **并发**：两个 worker 起在同一账本上，同一个任务只会有一次 `lease.acquired`；不同任务各自独立 git worktree。
 5. **预算熔断**：`--budget 10` 入队，跑一轮即 `blocked`，不会再花 token。
+
+## 真引擎（方案 1）
+
+`WB_ENGINE=opencode` 时，每个角色都起一次独立的 `opencode run`（不 `--continue`），
+所以 Verifier 天然拿不到 Coder 的上下文——角色分离不是靠提示词约束，是靠进程隔离。
+
+2026-11-18 在本机实测踩到的三个坑，provider 里已经全部兜住（`src/runner/providers/opencode.mjs`）：
+
+| 坑 | 现象 | 兜法 |
+| --- | --- | --- |
+| 要写 `~/.local/share/opencode` | `attempt to write a readonly database`，沙箱里必崩 | 把 `XDG_DATA_HOME/CACHE/STATE` 指到工作区内的 `WB_OC_HOME`（默认 `./.oc`） |
+| 报错时**不退出** | 实测挂 13 分钟、stdout 0 字节，stdout 一个字的错误都不给 | 盯它自己的日志文件（`${XDG_DATA_HOME}/opencode/log/*.log`），命中限流/额度/鉴权字样立刻 SIGKILL |
+| 空产出但 exit 0 | 看起来"干完了"，其实什么都没做 | 文本为空即判失败，绝不当成功 |
+
+两个体检命令，都是几秒钟出结论：
+
+```bash
+# 1) 引擎能不能用（不能用时直接告诉你原因，不会挂在那儿）
+WB_ENGINE=opencode WB_MODEL=<provider/model> node scripts/engine-smoke.mjs "只回复两个字 OK"
+
+# 2) 真任务基准：失败率 / 耗时 / token / 重试次数，报告写到 docs/bench-*.json
+WB_ENGINE=opencode WB_MODEL=<provider/model> node scripts/bench.mjs --fresh --tasks 3
+```
+
+基准用的是独立种子仓库 `.bench/repo`（不是 `sandbox/demo`），所以跑来跑去不会污染演示数据。
+
+**当前状态（诚实版）**：opencode 的免费额度已耗尽（`Free usage limit reached`），本机也没有任何模型 API key，
+`codex` 的 npm 包 vendor 二进制缺失（`spawn ... ENOENT`）。所以真引擎基准还没跑出数字，
+但管道已经能正确地把它判成 `blocked` 并停在那儿等人，而不是假装在干活。
 
 ## v0 不做什么（故意的）
 
@@ -94,5 +124,5 @@ src/server/   HTTP + 静态审阅界面
 web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
-scripts/      demo 重置
+scripts/      demo 重置、引擎体检（engine-smoke）、真引擎基准（bench）
 ```

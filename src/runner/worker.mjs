@@ -48,10 +48,15 @@ export async function runTask(db, id, ctx) {
       }
     } catch (e) {
       const cur = getTask(db, id);
-      addEvidence(db, id, { last_error: String(e && e.message || e), at: new Date().toISOString() }, "evidence.patch");
+      const msg = String(e && e.message || e);
+      addEvidence(db, id, { last_error: msg, at: new Date().toISOString() }, "evidence.patch");
+      record(db, { taskId: id, type: "run.error", actor: workerId, payload: { state: cur && cur.state, error: msg.slice(0, 400) } }, false);
       if (cur && cur.state === "blocked") return cur; // 熔断后的状态不许被 catch 重新拉回队列
-      if (cur && cur.attempts >= MAX_ATTEMPTS) {
-        transition(db, id, "blocked", { actor: workerId, reason: "error: " + (e && e.message) });
+      // 计划和验证阶段的失败不会涨 attempts（没走到 implementing），
+      // 只看 attempts 会让"每次调用都失败的引擎"无限重试、白烧时间。所以单独数错误。
+      const errors = db.prepare("SELECT COUNT(*) AS n FROM events WHERE task_id=? AND type='run.error'").get(id).n;
+      if ((cur && cur.attempts >= MAX_ATTEMPTS) || errors >= MAX_ATTEMPTS * 2) {
+        transition(db, id, "blocked", { actor: workerId, reason: "error(" + errors + "): " + msg.slice(0, 200) });
       } else {
         transition(db, id, "queued", { actor: workerId, reason: "retry after error" });
       }
