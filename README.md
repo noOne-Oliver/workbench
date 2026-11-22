@@ -274,6 +274,45 @@ node scripts/shot-roles.mjs
 ```
 
 ![两段评审：lead 看到「待初筛」和「待批准」两种卡，按钮就是权限矩阵](docs/roles-review.png)
+
+### 真引擎整单（2026-11-22，两段评审，app 外进程）
+
+mock 只能证明链路通，不能证明「真模型写的东西人愿意批」。这一单用真引擎（`gptagent/deepseek-v4.1-flash`）从提交跑到合并：
+
+| 指标 | 值 |
+| --- | --- |
+| 任务 | `t_mwrszckr0xwnk`「给 calc 加乘法、除法与除零报错」 |
+| 终态 | `done`（attempts=1，一次过） |
+| token | 444,497 / 2,000,000 |
+| 墙钟 | 111 秒（实现 + 验证 + 两段人工 + 合并） |
+| 机器护栏 | 6/6 全绿（11 条用例真跑过，无回归、无削弱、无同义反复） |
+| 改动 | 4 files changed, 55 insertions(+) |
+| 初筛 / 终审 | 2s / 2s（人只花了 4 秒，因为证据包直接给了结论） |
+| 合并提交 | `fbe16d8 wb: merge 给 calc 加乘法、除法与除零报错` |
+
+```bash
+# 整单：alice 提交 → 后台实现/验证 → bob 领取初筛 → lead0 批准 → 合并
+WB_ENGINE=opencode WB_MODEL=gptagent/deepseek-v4.1-flash \
+  node scripts/demo-real-review.mjs --fresh
+# 报告：docs/real-review-<stamp>.json（护栏明细、用例清单、事件时间线）
+```
+
+真实产出（合并后仓库里的 `src/calc.mjs`，除零真的抛错，不是只写注释）：
+
+```js
+export function calc(a, b, op) {
+  if (op === "+") return a + b;
+  if (op === "*") return a * b;
+  if (op === "/") {
+    if (b === 0) throw new Error("除零错误: division by zero");
+    return a / b;
+  }
+  throw new Error("未实现: " + op);
+}
+```
+
+![真引擎跑完的工作区：卡片上有 Verifier 结论、6/6 护栏、按文件分组的 diff](docs/real-review-ui.png)
+
 ### 进程管理
 
 ```bash

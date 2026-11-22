@@ -21,6 +21,7 @@
     "check": "node --test tests/*.test.mjs",
     "demo:reset": "node scripts/reset-demo.mjs",
     "demo:review": "node scripts/demo-review.mjs --fresh",
+    "demo:real": "node scripts/demo-real-review.mjs --fresh",
     "shot:roles": "node scripts/shot-roles.mjs",
     "verify:package": "node scripts/verify-package.mjs"
   }
