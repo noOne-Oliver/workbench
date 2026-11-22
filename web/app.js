@@ -502,7 +502,39 @@ if (composeForm) {
   });
 }
 
+// 执行器活体：worker 崩了/被杀了，这一行会立刻变红。
+// 没有它的时候，"队列没人消费"和"暂时没任务"长得一模一样 —— 最贵的失败是无感。
+async function loadHealth() {
+  const box = el("kernel-state");
+  if (!box) return;
+  try {
+    const r = await fetch("/api/health", { cache: "no-store" });
+    const h = await r.json();
+    const w = h.worker || {};
+    const staleCode = w.alive && w.version && h.version && w.version !== h.version;
+    if (staleCode) {
+      // 版本不一致就是"跑着的进程是旧代码"——真实事故就死在这里，不红不行。
+      box.className = "mono bad";
+      box.textContent = "执行器 跑着旧代码 v" + w.version + "（内核 v" + h.version + "）· 重启内核";
+      box.title = "进程还是启动时的旧代码，新状态它不认识。杀掉内核重启即可（cli up 会自己拉起 worker）";
+    } else if (w.alive) {
+      box.className = "mono ok";
+      box.textContent = "执行器 在线 · " + (w.age_s ?? 0) + "s 前心跳";
+      box.title = "pid " + (w.pid || "?") + " · 引擎 " + (w.engine || h.engine || "?") + " · 内核已运行 " + (h.uptime_s || 0) + "s";
+    } else {
+      box.className = "mono bad";
+      box.textContent = "执行器 已断线" + (w.age_s == null ? "" : " " + w.age_s + "s") + " · 任务不会推进";
+      box.title = "worker 心跳超时（>" + (w.stale_after_s || 20) + "s）。它会按退避自动重启；一直红说明反复崩溃，看日志";
+    }
+  } catch {
+    box.className = "mono bad";
+    box.textContent = "执行器 未知（连不上内核）";
+  }
+}
+
 loadWorkspace();
 load();
 loadFeed();
+loadHealth();
 setInterval(() => { load(); loadFeed(); }, 2500);
+setInterval(loadHealth, 4000);

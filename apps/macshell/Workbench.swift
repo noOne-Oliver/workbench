@@ -371,7 +371,7 @@ enum ProbeResult {
     var summary: String {
         switch self {
         case .kernel(let n):
-            return "内核在线，tasks=\(n)"
+            return n < 0 ? "内核在线（登录墙内，未取任务数）" : "内核在线，tasks=\(n)"
         case .occupied(let status, let detail):
             return "GET /api/tasks → HTTP \(status)：\(detail)"
         case .down(let detail):
@@ -407,7 +407,9 @@ enum ProbeTransport {
 
         let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
         if status == 401 {
-            return .occupied(status: status, detail: "服务要求 token（检查 WB_TOKEN 是否与服务一致）")
+            // 401 = 内核在，只是要登录（新工作区默认会建 lead 账号 + 一次性口令）。
+            // 早期版本把 401 当成"端口被别的服务占了"，于是每个新用户第一次启动都被挡住。
+            return .kernel(tasks: -1)
         }
         if let obj, let tasks = obj["tasks"] as? [Any] {
             return .kernel(tasks: tasks.count)
@@ -605,8 +607,10 @@ final class Kernel {
     }
 
     var dataDir: URL { workspace.appendingPathComponent("data", isDirectory: true) }
-    var serverChild: ShellChild? { children.first { $0.name == "server" } }
-    var workerChild: ShellChild? { children.first { $0.name == "worker" } }
+    /// 现在只有一个子进程：cli.mjs up（它自己看护 worker，崩了自动拉起）。
+    /// 名字还叫 serverChild 是因为外壳用它判断"内核还在不在"、以及 ⌘R 重启。
+    var serverChild: ShellChild? { children.first { $0.name == "kernel" } }
+    var workerChild: ShellChild? { nil }
 
     // MARK: 日志
 
@@ -662,7 +666,7 @@ final class Kernel {
     func logRuntimeInfo(attached: Bool, tasks: Int) {
         workspaceSnapshotAsync { [weak self] snap in
             guard let self else { return }
-            self.writeLog("==== \(isoNow()) ready mode=\(attached ? "attach" : "spawn") tasks=\(tasks) "
+            self.writeLog("==== \(isoNow()) ready mode=\(attached ? "attach" : "spawn") tasks=\(tasks < 0 ? "?" : String(tasks)) "
                 + "port=\(self.port) workspace=\(snap?.root ?? self.workspace.path) "
                 + "code=\(snap?.code ?? self.paths.root.path) engine=\(snap?.engine ?? "?") ====")
         }
@@ -682,26 +686,15 @@ final class Kernel {
         writeLog("==== \(isoNow()) shell spawn ====")
         writeLog("==== workspace: \(info.summary)（来源：\(workspaceSource)） ====")
         writeLog("==== kernel: \(paths.root.path)（\(paths.source)）node=\(paths.node.path) ====")
-        writeLog("==== server: \(paths.serverCommand) ====")
-        writeLog("==== worker: \(paths.workerCommand) ====")
+        writeLog("==== kernel: \(paths.node.path) \(paths.cliEntry.path) up ====")
 
-        let server = try spawnChild(name: "server",
-                                    arguments: [paths.serverEntry.path],
+        // 一个进程搞定：up 里起 server + worker，并且看护 worker（崩了退避重启）。
+        // 外壳不再负责"发现 worker 死了" —— 这件事交给更懂进程的看护者，外壳只管窗口。
+        let kernel = try spawnChild(name: "kernel",
+                                    arguments: [paths.cliEntry.path, "up"],
                                     extra: ["WB_PORT": String(port)])
-        children = [server]
-        gServerPid = server.process.processIdentifier
-
-        do {
-            let worker = try spawnChild(name: "worker",
-                                        arguments: [paths.cliEntry.path, "run"],
-                                        extra: [:])
-            children.append(worker)
-            gWorkerPid = worker.process.processIdentifier
-        } catch {
-            // worker 起不来时别把 server 留成孤儿
-            stopChildren(reason: "worker spawn failed")
-            throw error
-        }
+        children = [kernel]
+        gServerPid = kernel.process.processIdentifier
     }
 
     private func spawnChild(name: String, arguments: [String], extra: [String: String]) throws -> ShellChild {
@@ -744,17 +737,15 @@ final class Kernel {
         if !rest.isEmpty { writer.consume(rest) }
         writer.flush()
         writeLog("==== \(isoNow()) \(name) exited code=\(code) ====")
-        if name == "server" { gServerPid = 0 } else { gWorkerPid = 0 }
+        if name == "kernel" { gServerPid = 0 } else { gWorkerPid = 0 }
 
         let intentional = stopping
         children.removeAll { $0.name == name }
         if intentional { return }
 
-        if name == "server" {
-            onUnexpectedExit?(name, code)
-        } else {
-            writeLog("==== 警告：worker 意外退出（exit=\(code)），任务会停在排队状态；⌘R 可重启 ====")
-        }
+        // 内核整棵退出才需要外壳介入；worker 崩了由 up 自己拉起（退避 1s→2s→4s…封顶 30s）。
+        writeLog("==== 警告：内核意外退出（exit=\(code)）；⌘R 可重启 ====")
+        onUnexpectedExit?(name, code)
     }
 
     /// 只终止自己起的子进程：worker 先收、server 后收，每个 SIGTERM → 等 3 秒 → SIGKILL。
@@ -1123,7 +1114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         kernel.logRuntimeInfo(attached: attached, tasks: tasks)
         let mode = attached ? "attach" : "spawn"
         print("ready mode=\(mode) port=\(kernel.port) workspace=\(kernel.workspace.path) "
-            + "code=\(kernel.paths.root.path) tasks=\(tasks) log=\(kernel.logURL.path)")
+            + "code=\(kernel.paths.root.path) tasks=\(tasks < 0 ? "?" : String(tasks)) log=\(kernel.logURL.path)")
         NSLog("workbench shell ready: tasks=%d mode=%@ port=%d workspace=%@ code=%@",
               tasks, mode, kernel.port, kernel.workspace.path, kernel.paths.root.path)
     }
@@ -1261,7 +1252,7 @@ enum SmokeCheck {
         switch kernel.probeSync() {
         case .kernel(let n):
             let snap = kernel.workspaceSnapshotSync()
-            print("kernel=ok tasks=\(n) mode=attach port=\(port) "
+            print("kernel=ok tasks=\(n < 0 ? "?" : String(n)) mode=attach port=\(port) "
                 + "workspace=\(snap?.root ?? info.root) code=\(snap?.code ?? paths.root.path) "
                 + "engine=\(snap?.engine ?? "?")")
             exit(0)
@@ -1286,7 +1277,7 @@ enum SmokeCheck {
 
             if case .kernel(let n) = kernel.probeSync() {
                 let snap = kernel.workspaceSnapshotSync()
-                print("kernel=ok tasks=\(n) mode=spawn port=\(port) "
+                print("kernel=ok tasks=\(n < 0 ? "?" : String(n)) mode=spawn port=\(port) "
                     + "workspace=\(snap?.root ?? info.root) code=\(snap?.code ?? paths.root.path) "
                     + "engine=\(snap?.engine ?? "?") "
                     + "server=\(kernel.serverChild?.process.processIdentifier ?? -1) "

@@ -95,6 +95,24 @@ export function transition(db, id, to, { actor = "system", reason = null } = {})
   return getTask(db, id);
 }
 
+/**
+ * 逃生门：只有"状态机里没有的路"才用它 —— 例如老进程遇到新状态。
+ * 严格版 transition() 会直接抛错，抛错就意味着这个任务永远卡在那里、被反复认领。
+ * 卡住不算最坏，反复认领的无限循环才会把磁盘写满（真实事故：2 小时写了 17GB、8600 万条事件）。
+ */
+export function forceTransition(db, id, to, { actor = "system", reason = null } = {}) {
+  const t = getTask(db, id);
+  if (!t) throw new Error(`任务不存在: ${id}`);
+  if (t.state === to) return t;
+  record(db, {
+    taskId: id,
+    type: "task.transition",
+    actor,
+    payload: { from: t.state, to, reason, forced: true },
+  });
+  return getTask(db, id);
+}
+
 export function isTerminal(state) {
   return TERMINAL.has(state);
 }

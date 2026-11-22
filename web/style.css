@@ -120,3 +120,8 @@ form.adduser input, form.adduser select { background: #0b0f14; color: var(--fg);
 #team-msg { color: var(--ok); margin-top: 10px; white-space: pre-wrap; }
 
 
+
+/* 执行器活体：在线绿、断线红；一行字比一个弹窗有用（弹窗会被关掉，这行一直在） */
+#kernel-state { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line, #ddd); }
+#kernel-state.ok { color: #1a7f37; border-color: #b7e1c1; background: #eefbf1; }
+#kernel-state.bad { color: #b42318; border-color: #f3b7b0; background: #fdecea; font-weight: 600; }

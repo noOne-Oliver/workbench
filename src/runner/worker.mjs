@@ -1,5 +1,5 @@
 import { openDb } from "../core/db.mjs";
-import { getTask, listTasks, transition, record, spendBudget, addEvidence, overBudget } from "../core/ledger.mjs";
+import { getTask, listTasks, transition, record, spendBudget, addEvidence, overBudget, forceTransition } from "../core/ledger.mjs";
 import { acquire, renew, release, reclaimExpired, reclaimDead } from "../core/lease.mjs";
 import { hostname } from "node:os";
 import { getProvider } from "./engine.mjs";
@@ -8,7 +8,8 @@ import { loadRepoConfig, runGuards } from "./guards.mjs";
 import { classifySize, repoFileCount } from "../core/sizing.mjs";
 import * as sop from "./sop.mjs";
 import { resolve, join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
+import { startHeartbeat } from "../core/liveness.mjs";
 
 import { BUILTIN_ENGINES } from "./providers/index.mjs";
 export { BUILTIN_ENGINES };
@@ -24,10 +25,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** 可被认领的任务：非暂停态 + 租约空闲或已过期（崩溃恢复走这条路）。 */
 export function pickRunnable(db) {
   return db.prepare(
-    "SELECT id FROM tasks WHERE state NOT IN ('awaiting_review','awaiting_approval','awaiting_human','done','blocked','failed') " +
+    "SELECT id, state FROM tasks WHERE state NOT IN ('awaiting_review','awaiting_approval','awaiting_human','done','blocked','failed') " +
     "AND (lease_expires_at IS NULL OR lease_expires_at < ?) ORDER BY created_at ASC LIMIT 1"
   ).get(Date.now());
 }
+
+/** 这个泵真正会处理的状态。不在这里的一律算"不认识"——见 pump 里的兜底。 */
+/** 内核版本：心跳里带上它，才能看出"跑着的进程是旧代码"。 */
+export function codeVersion() {
+  try {
+    return JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version || "unknown";
+  } catch { return "unknown"; }
+}
+
+export const HANDLED_STATES = new Set(["queued", "planning", "implementing", "verifying", "reviewing", "merging"]);
 
 export async function runTask(db, id, ctx) {
   const { workerId, provider } = ctx;
@@ -421,24 +432,65 @@ async function doMerge(db, id, ctx) {
 }
 
 /** 主泵：认领 -> 跑到暂停点 -> 释放租约。可被 kill -9，重启后从状态机续跑。 */
-export async function pump(db, { workerId, provider, once = false, idleMs = 1500, onTask } = {}) {
-  for (;;) {
-    reclaimDead(db);
-    reclaimExpired(db);
-    const cand = pickRunnable(db);
-    if (!cand) {
-      if (once) return null;
-      await sleep(idleMs);
-      continue;
+export async function pump(db, { workerId, provider, once = false, idleMs = 1500, onTask, heartbeat = true, engine = "unknown" } = {}) {
+  // 活着要有痕迹：worker 崩了界面得看得出来（见 src/core/liveness.mjs）
+  const stopBeat = heartbeat
+    ? startHeartbeat(join(ROOT, "data", "worker.json"), { workerId, engine, root: ROOT, version: codeVersion() })
+    : null;
+  const stalls = new Map();
+  try {
+    for (;;) {
+      reclaimDead(db);
+      reclaimExpired(db);
+      const cand = pickRunnable(db);
+      if (!cand) {
+        if (once) return null;
+        await sleep(idleMs);
+        continue;
+      }
+      // 不认识的状态：宁可停住等人，也不能原地空转。
+      // 真实事故：老进程 + 新状态 → runTask 立刻 return → 泵每毫秒重来一次，
+      // 2 小时写了 17GB、8600 万条 lease 事件，最后 V8 自己 abort。
+      if (!HANDLED_STATES.has(cand.state)) {
+        record(db, {
+          taskId: cand.id, type: "run.stalled", actor: workerId,
+          payload: { state: cand.state, note: "执行器不认识这个状态（多半是内核版本不一致）" },
+        }, false);
+        forceTransition(db, cand.id, "blocked", {
+          actor: workerId,
+          reason: "执行器不认识状态 " + cand.state + "：重启内核（cli up）后重新入队",
+        });
+        process.stderr.write("[worker] 状态 " + cand.state + " 不认识，已把 " + cand.id + " 停到 blocked\n");
+        continue;
+      }
+      if (!acquire(db, cand.id, workerId, 300000)) continue;
+      const before = getTask(db, cand.id);
+      try {
+        const t = await runTask(db, cand.id, { workerId, provider, cwd: ROOT });
+        if (onTask && t) onTask(t);
+        // 兜底：认领了却什么都没推进（doX 提前 return、状态机写坏），也不能空转。
+        const after = getTask(db, cand.id);
+        const sig = (x) => x ? x.state + "|" + x.attempts + "|" + x.spent_tokens : "gone";
+        if (before && after && sig(before) === sig(after) && HANDLED_STATES.has(after.state)) {
+          stalls.set(cand.id, (stalls.get(cand.id) || 0) + 1);
+          const n = stalls.get(cand.id);
+          if (n >= 3) {
+            record(db, { taskId: cand.id, type: "run.stalled", actor: workerId, payload: { state: after.state, rounds: n } }, false);
+            forceTransition(db, cand.id, "blocked", { actor: workerId, reason: "连续 " + n + " 轮认领但状态没有推进（停在 " + after.state + "）" });
+            stalls.delete(cand.id);
+          } else {
+            await sleep(250 * n);
+          }
+        } else {
+          stalls.delete(cand.id);
+        }
+      } finally {
+        release(db, cand.id, workerId, "yield");
+      }
+      if (once) return cand.id;
     }
-    if (!acquire(db, cand.id, workerId, 300000)) continue;
-    try {
-      const t = await runTask(db, cand.id, { workerId, provider, cwd: ROOT });
-      if (onTask && t) onTask(t);
-    } finally {
-      release(db, cand.id, workerId, "yield");
-    }
-    if (once) return cand.id;
+  } finally {
+    if (stopBeat) stopBeat();
   }
 }
 
@@ -449,7 +501,7 @@ async function main() {
   const provider = await getProvider(engineName);
   process.stdout.write("[worker] " + workerId + " engine=" + engineName + " root=" + ROOT + "\n");
   await pump(db, {
-    workerId, provider,
+    workerId, provider, engine: engineName,
     onTask: (t) => process.stdout.write("[worker] " + t.id + " -> " + t.state + " attempts=" + t.attempts + "\n"),
   });
 }

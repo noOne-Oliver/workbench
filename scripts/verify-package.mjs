@@ -29,14 +29,20 @@ const PORT = Number(opt("port", "7631"));
 const WS = resolve(opt("ws", join(mkdtempSync(join(tmpdir(), "wb-pkg-")), "ws")));
 const KEEP = args.includes("--keep");
 const BIN = join(APP, "Contents/MacOS/Workbench");
+// 新工作区会自动建 lead 账号（要登录），脚本用 token 走机器身份，避免每次都去日志里捞一次性口令。
+const TOKEN = "wb-verify-" + process.pid;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const launched = [];
 function fail(msg) {
+  // 失败也要把起过的 app 收掉，否则残留内核会占着端口，下一次运行直接"端口被占用"（踩过）。
+  for (const p of launched) { try { p.kill("SIGKILL"); } catch {} }
   console.error("FAIL " + msg);
   process.exit(2);
 }
 async function api(path, init) {
-  const r = await fetch("http://127.0.0.1:" + PORT + path, init);
+  const headers = { ...(init && init.headers), "x-wb-token": TOKEN };
+  const r = await fetch("http://127.0.0.1:" + PORT + path, { ...init, headers });
   if (!r.ok) throw new Error(path + " → HTTP " + r.status);
   return r.json();
 }
@@ -57,12 +63,13 @@ async function waitClosed(ms) {
 function launch() {
   const p = spawn(BIN, [], {
     cwd: "/tmp", // 故意离开仓库：证明不依赖当前目录
-    env: { ...process.env, WB_WORKSPACE: WS, WB_PORT: String(PORT), WB_ENGINE: "mock" },
+    env: { ...process.env, WB_WORKSPACE: WS, WB_PORT: String(PORT), WB_ENGINE: "mock", WB_TOKEN: TOKEN },
     stdio: ["ignore", "pipe", "pipe"],
   });
   p.out = "";
   p.stdout.on("data", (d) => (p.out += d));
   p.stderr.on("data", (d) => (p.out += d));
+  launched.push(p);
   return p;
 }
 const kill = (p, sig) => { try { p.kill(sig); } catch {} };
@@ -101,10 +108,11 @@ try {
     task = list.tasks.find((t) => t.id === id);
     if (!task) fail("任务消失了：" + id);
     if (seen[seen.length - 1] !== task.state) seen.push(task.state);
-    if (["awaiting_human", "blocked", "done"].includes(task.state)) break;
+    // 现在有两段人工：awaiting_review（初筛）与 awaiting_approval（终审）；旧账本可能还是 awaiting_human。
+    if (task.state.startsWith("awaiting_") || ["blocked", "done"].includes(task.state)) break;
   }
   console.log("states=" + seen.join(" → "));
-  if (task.state !== "awaiting_human") fail("任务没跑到待裁决，停在 " + task.state + "：" + JSON.stringify(task.evidence && task.evidence.verify));
+  if (!task.state.startsWith("awaiting_")) fail("任务没跑到等人裁决，停在 " + task.state + "：" + JSON.stringify(task.evidence && task.evidence.verify));
   if (task.attempts < 1) fail("attempts=" + task.attempts + "，worker 好像没真跑");
 
   kill(app, "SIGTERM");
@@ -126,7 +134,31 @@ try {
   if (!(await waitClosed(20000))) fail("kill -9 之后 20 秒端口还开着：内核成了孤儿（看 src/core/orphan.mjs 的 WB_PARENT_PID 有没有注入）");
   console.log("SIGKILL：" + ((Date.now() - t0) / 1000).toFixed(1) + " 秒后内核自己收工，没留孤儿");
 
-  console.log("PASS 离仓可运行 / 工作区正确 / worker 真跑 / SIGTERM 干净 / kill -9 无孤儿");
+  // ---- 第三段：worker 被杀掉后，看护要把它拉起来（执行器不能悄悄死掉） ----
+  const app3 = launch();
+  let h = null;
+  for (let i = 0; i < 40 && !h; i++) {
+    await sleep(500);
+    try { h = await (await fetch("http://127.0.0.1:" + PORT + "/api/health")).json(); } catch {}
+  }
+  if (!h || !h.worker || !h.worker.alive) fail("健康接口没报出活着的 worker：" + JSON.stringify(h));
+  const deadPid = h.worker.pid;
+  try { process.kill(deadPid, "SIGKILL"); } catch (e) { fail("杀 worker 失败：" + e.message); }
+  let revived = null;
+  for (let i = 0; i < 30 && !revived; i++) {
+    await sleep(1000);
+    try {
+      const x = await (await fetch("http://127.0.0.1:" + PORT + "/api/health")).json();
+      if (x.worker && x.worker.alive && x.worker.pid !== deadPid) revived = x.worker;
+    } catch {}
+  }
+  if (!revived) fail("worker 被杀掉后没被看护拉起来（看 src/core/supervisor.mjs）");
+  console.log("watchdog：" + deadPid + " 被杀 → " + revived.pid + " 接管（" + revived.age_s + "s 前心跳）");
+  kill(app3, "SIGTERM");
+  await Promise.race([new Promise((r) => app3.once("exit", r)), sleep(8000)]);
+  if (!(await waitClosed(10000))) fail("第三段 SIGTERM 之后端口还开着");
+
+  console.log("PASS 离仓可运行 / 工作区正确 / worker 真跑 / SIGTERM 干净 / kill -9 无孤儿 / worker 崩了自愈");
   console.log("task=" + id + " attempts=" + task.attempts + " spent=" + task.spent_tokens);
 } catch (err) {
   fail(err && err.message || String(err));

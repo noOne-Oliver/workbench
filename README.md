@@ -64,7 +64,8 @@ node src/cli.mjs enqueue --title "..." --repo <dir> [--owner <name>] [--budget 1
 node src/cli.mjs status [--id <task>]              # 看任务与事件流
 node src/cli.mjs rebuild                           # 从事件全量重建投影（自愈）
 node src/cli.mjs run [--once] [--worker host:pid]  # 跑 worker
-node src/cli.mjs serve [--port 7317]               # 起审阅服务
+node src/cli.mjs serve [--port 7317]               # 只起审阅服务
+node src/cli.mjs up                                # 起整套（server + 看护着的 worker，worker 崩了自动拉起）
 npm run web                                        # Web 版：起 server + worker（见「Web 版」一节）
 npm run web:status | web:logs | web:stop           # 看/跟/停
 npm run demo:reset                                 # 把 sandbox/demo 恢复到种子状态
@@ -92,6 +93,8 @@ npm test                                           # 内核测试（状态机/�
 | `WB_HEARTBEAT_MS` | `15000` | 每跑一个 agent 多久落一次心跳（`agent.heartbeat`），界面靠它显示「已跑 1m23s」 |
 | `WB_SILENT_MS` | `60000` | 多久没有事件就判「worker 可能已停」并在卡片上报警 |
 | `WB_NO_BASELINE` | 空 | 设成 1 关掉回归基线对比（没有 git 历史时用），此时 `no_regression` 只验证当前全绿 |
+| `WB_WORKER_BEAT_MS` | `5000` | worker 心跳写文件的间隔；界面靠它判「执行器在线/断线」 |
+| `WB_WORKER_STALE_MS` | `20000` | 心跳超过多久算断线（徽章变红「任务不会推进」） |
 | `WB_PARENT_PID` | 空 | app 注入：内核发现 `ppid` 不是它就自己收工。防 `kill -9` 之后留下孤儿内核（手动起时不用设） |
 
 ## 五条验收怎么复现
@@ -543,6 +546,58 @@ baseline  {"ok":false,"pass":0,"fail":4,"regressions":[],"fixed":["add","sub","m
 ![review 界面：测试清单 + 回归 + 按文件分组的 diff](docs/review-diff.png)
 
 ![全屏原始输出：只有一层滚动](docs/review-raw.png)
+
+## 执行器崩了会自己起来（2026-11-22 事故复盘）
+
+这一节是给「无人值守」补的最后一块：**任务失败有人兜，执行器死了没人知道**，才是最贵的失败。
+
+### 发生了什么
+
+1. `node src/runner/worker.mjs` 跑了 2 小时 32 分后 `exit 134`（SIGABRT）。崩溃栈在 `node::Environment::RunTimers` → `CloneObjectIC_Slow` → `Runtime_CopyDataProperties`，是 V8 在定时器续体里做对象展开时自己 abort 的，不是 try/catch 能接住的东西。
+2. 更要命的是账本：`data/ledger.db` 已经 **17GB**，里面 **86,864,540 条事件**，绝大多数是 `lease.acquired` / `lease.renewed` / `lease.released`，每毫秒三对。
+3. 根因不是 V8，是**老进程 + 新状态**。两段评审上线后，一个任务被迁移成 `awaiting_approval`；而当时跑着的 worker 还是更早启动的旧代码，它的 `pickRunnable` 不认识这个状态 —— 挑出来 → `runTask` 的 `switch` 没有分支 → 立刻 `return` → 释放租约 → 再挑同一个。12:08 到 14:19，两小时空转把磁盘写满，最后进程被自己写崩。
+
+两个教训：**状态机里不认识的状态不能被反复认领**；**跑着的进程是旧代码这件事必须看得见**。
+
+### 五层修复
+
+| 层 | 做法 | 代码 |
+| --- | --- | --- |
+| 进程 | worker 挂了按 1s→2s→4s…封顶 30s 退避自动拉起，跑稳 60s 计数清零 | `src/core/supervisor.mjs` + `cli.mjs up` |
+| 可见 | worker 每 5s 写 `data/worker.json` 心跳，`GET /api/health` 免登录读它 | `src/core/liveness.mjs` + `src/server/index.mjs` |
+| 界面 | 标题栏常驻「执行器 在线 · Ns 前心跳」，超过 20s 变红「任务不会推进」 | `web/app.js` `loadHealth()` |
+| 卡死 | 认领到不认识的状态：留 `run.stalled` 证据 + `forceTransition` 停到 `blocked`，绝不空转 | `src/runner/worker.mjs` 的 pump、`ledger.forceTransition` |
+| 版本 | 心跳带内核版本，`/api/health` 也回服务端版本；不一致徽章直接变红「跑着旧代码」 | `codeVersion()` + `web/app.js` |
+
+再补一条兜底：认领了但状态/尝试次数/花费都没变，连续 3 轮就停到 `blocked`（`连续 3 轮认领但状态没有推进`），前两轮各睡 250ms / 500ms。
+
+### 验一遍
+
+```bash
+# 1) 整个内核（server + 看护着的 worker）一条命令起
+node src/cli.mjs up
+
+# 2) 看活体（免登录，只有 pid/心跳/版本）
+curl -s http://127.0.0.1:7317/api/health
+
+# 3) 杀掉 worker，几秒后它自己回来（pid 变了）
+kill -9 $(curl -s http://127.0.0.1:7317/api/health | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).worker.pid))')
+sleep 4 && curl -s http://127.0.0.1:7317/api/health
+```
+
+打包产物里这条链路是端到端的，`npm run verify:package` 会真杀一次 worker 再等它自己起来：
+
+```
+states=queued → verifying → awaiting_review
+SIGTERM：端口已关闭
+SIGKILL：3.0 秒后内核自己收工，没留孤儿
+watchdog：52873 被杀 → 52878 接管（1s 前心跳）
+PASS 离仓可运行 / 工作区正确 / worker 真跑 / SIGTERM 干净 / kill -9 无孤儿 / worker 崩了自愈
+```
+
+![执行器在线：标题栏常驻心跳，断线就变红](docs/executor-live.png)
+
+事故当天的账本已从 17GB 删掉重建（`data/` 是 gitignore 的本地状态，重建只需 `node src/cli.mjs workspace --dir .`）。
 
 ## v0 不做什么（故意的）
 

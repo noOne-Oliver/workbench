@@ -54,8 +54,9 @@ async function main() {
     const { watchParent } = await import("./core/orphan.mjs");
     watchParent({ log: (m) => process.stderr.write("[worker] " + m + "\n") });
     const { pump } = await import("./runner/worker.mjs");
-    const provider = await getProvider(process.env.WB_ENGINE || "mock");
-    await pump(db, { workerId: arg("worker", hostname() + ":" + process.pid), provider, once: process.argv.includes("--once") });
+    const engineName = process.env.WB_ENGINE || "mock";
+    const provider = await getProvider(engineName);
+    await pump(db, { workerId: arg("worker", hostname() + ":" + process.pid), provider, engine: engineName, once: process.argv.includes("--once") });
     return;
   }
   if (cmd === "workspace") {
@@ -120,12 +121,58 @@ async function main() {
     }
     return;
   }
+  // 一条命令起整套：server + 看护着的 worker。
+  // 外壳只 spawn 这一个进程，worker 崩了由这里的 supervise 拉起来 —— 人不用守着。
+  if (cmd === "up") {
+    const { spawn } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname } = await import("node:path");
+    const { supervise } = await import("./core/supervisor.mjs");
+    const { watchParent } = await import("./core/orphan.mjs");
+    const log = (m) => process.stderr.write("[up] " + m + "\n");
+    watchParent({ log });
+    const self = fileURLToPath(import.meta.url);
+    const here = dirname(self);
+    const env = { ...process.env, WB_PARENT_PID: String(process.pid) };
+    const kids = [];
+    const launch = (args) => {
+      const p = spawn(process.execPath, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+      p.stdout.on("data", (d) => process.stdout.write(d));
+      p.stderr.on("data", (d) => process.stderr.write(d));
+      kids.push(p);
+      return p;
+    };
+    let exiting = false;
+    const shutdown = (code) => {
+      if (exiting) return;
+      exiting = true;
+      try { sup.stop(); } catch {}
+      for (const k of kids) { try { k.kill("SIGTERM"); } catch {} }
+      setTimeout(() => process.exit(code), 250).unref();
+    };
+    const server = launch([join(here, "server", "index.mjs")]);
+    const sup = supervise(() => launch([self, "run"]), {
+      log,
+      onExit: (code, signal, s) => {
+        if (s.restarts >= 3) log("worker 连续退出 " + s.restarts + " 次，界面 /api/health 会显示断线");
+      },
+    });
+    process.on("SIGTERM", () => shutdown(0));
+    process.on("SIGINT", () => shutdown(0));
+    server.once("exit", (code, signal) => {
+      process.stderr.write("[up] server 退出 code=" + code + " signal=" + signal + "，整体收工\n");
+      shutdown(code || 1);
+    });
+    log("server pid=" + server.pid + " worker pid=" + (sup.child() && sup.child().pid));
+    await new Promise(() => {});
+    return;
+  }
   if (cmd === "serve") {
     const { startServer } = await import("./server/index.mjs");
     startServer();
     return;
   }
-  process.stdout.write("用法: cli.mjs <init|workspace|cred|user|enqueue|status|rebuild|run|serve>\n");
+  process.stdout.write("用法: cli.mjs <init|workspace|cred|user|enqueue|status|rebuild|run|serve|up>\n");
 }
 
 main().catch((e) => { process.stderr.write(String(e && e.stack || e) + "\n"); process.exit(1); });

@@ -6,6 +6,8 @@ import { createTask, getTask, listTasks, transition, record, addEvidence, migrat
 import { readForTask } from "../core/events.mjs";
 import { feed as readFeed, live as readLive } from "../core/activity.mjs";
 import { watchParent } from "../core/orphan.mjs";
+import { readHeartbeat } from "../core/liveness.mjs";
+import { codeVersion } from "../runner/worker.mjs";
 import { can } from "../core/permissions.mjs";
 import {
   ROLES, authEnabled, createUser, ensureBootstrapAdmin, ensureLegacyOwners, getUser, listUsers,
@@ -97,6 +99,20 @@ export function createApp(db) {
       if (path === "/api/logout" && req.method === "POST") {
         setCookie(res, "", 0);
         return json(res, 200, { ok: true });
+      }
+
+      // 执行器活体：worker 崩了/被系统杀了，这里立刻看得出来。
+      // 没有这个接口时，最贵的失败是「界面一片平静，队列其实没人消费」。
+      // 免登录：它只说"有没有人在干活"，不吐路径、不吐任务内容。
+      if (req.method === "GET" && path === "/api/health") {
+        return json(res, 200, {
+          ok: true,
+          pid: process.pid,
+          uptime_s: Math.round(process.uptime()),
+          engine: process.env.WB_ENGINE || "mock",
+          version: codeVersion(),
+          worker: readHeartbeat(resolve(ROOT, "data", "worker.json")),
+        });
       }
 
       if (path.startsWith("/api/") && authRequired && !me) return json(res, 401, { error: "unauthorized" });
