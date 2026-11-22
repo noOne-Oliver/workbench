@@ -77,7 +77,8 @@ test("worker：每次 agent 调用都落 started/finished（带 token 与耗时�
   process.env.WB_HEARTBEAT_MS = "20";
   const { pump } = await import("../src/runner/worker.mjs");
   const db = freshDb();
-  const { id } = createTask(db, { title: "x", repo: join(root, "no-repo"), owner: "a" });
+  // 标题带高危词 → 判 large，走完整的 lead + architect 两段（本用例测的是活动流，不是体量分级）
+  const { id } = createTask(db, { title: "重构 calc 的运算符分支", repo: join(root, "no-repo"), owner: "a" });
   const provider = {
     run: async () => {
       await new Promise((r) => setTimeout(r, 80));

@@ -5,6 +5,7 @@ import { hostname } from "node:os";
 import { getProvider } from "./engine.mjs";
 import { sh, ensureWorktree, resetToBase, commitAll, diffStat, diffPatch, headSha, isGitRepo } from "./worktree.mjs";
 import { loadRepoConfig, runGuards } from "./guards.mjs";
+import { classifySize, repoFileCount } from "../core/sizing.mjs";
 import * as sop from "./sop.mjs";
 import { resolve, join } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -143,15 +144,31 @@ function scratchFor(id) {
   return d;
 }
 
+/**
+ * 规划阶段。体量分级决定要不要花「拆解 + 定边界」两次调用：
+ * 每个 agent 调用光 harness + 推理就要 7~17 万 token，小改动上这两刀纯属浪费。
+ * 但省钱不能省质量：small 只在第一次尝试走快路径，一旦没过（attempts > 0）
+ * 就自动降级成 normal，重试时拿到完整拆解。
+ */
 async function doPlanning(db, id, ctx) {
   const t = getTask(db, id);
   const dir = scratchFor(id);
   const repoAbs = resolve(ROOT, t.repo);
+  const { size, reason } = classifySize(t, { repoFiles: repoFileCount(repoAbs) });
+  record(db, { taskId: id, type: "task.sized", actor: ctx.workerId, payload: { size, reason, attempt: t.attempts } }, false);
+  addEvidence(db, id, { size, size_reason: reason }, "evidence.patch");
+
+  if (size === "small" && t.attempts === 0) {
+    record(db, { taskId: id, type: "plan.skipped", actor: ctx.workerId, payload: { size, reason: reason + "；Coder 自己决定实现方式，Verifier 仍然独立" } }, false);
+    transition(db, id, "implementing", { actor: ctx.workerId, reason: "fast path: " + size });
+    return;
+  }
+
   const lead = await callAgent(db, id, { ...ctx, cwd: dir }, { role: "lead", prompt: sop.leadPrompt(t, repoAbs) });
   const arch = await callAgent(db, id, { ...ctx, cwd: dir }, { role: "architect", prompt: sop.architectPrompt(t, lead.text, repoAbs) });
   record(db, { taskId: id, type: "plan.produced", actor: "architect", payload: { plan_md: arch.text } });
   record(db, { taskId: id, type: "slices.produced", actor: "lead", payload: { slices: lead.text } });
-  transition(db, id, "implementing", { actor: ctx.workerId, reason: "plan ready" });
+  transition(db, id, "implementing", { actor: ctx.workerId, reason: "plan ready (" + size + ")" });
 }
 
 /**
@@ -317,13 +334,27 @@ async function doReview(db, id, ctx) {
   const t = getTask(db, id);
   const dir = join(WORKTREES, id);
   const base = t.base_sha;
-  const guards = { checks: (t.evidence && t.evidence.verify && t.evidence.verify.guards) || [], ok: true, failed: [] };
-  const testOutput = (t.evidence && t.evidence.verify && t.evidence.verify.testOutputTail) || "";
-  const diff = base ? diffPatch(dir, base, 12000) : "";
+  const verify = (t.evidence && t.evidence.verify) || {};
+  const guards = { checks: verify.guards || [], ok: true, failed: [] };
 
+  // 小改动不再多花一次 agent 调用：护栏 + 独立 Verifier 已经答完「对不对」，
+  // 剩下的「要不要合」本来就是人初筛的活。跳过要留痕，否则以后没人知道这里少了一道。
+  if (t.evidence && t.evidence.size === "small") {
+    record(db, {
+      taskId: id, type: "review.skipped", actor: ctx.workerId,
+      payload: { size: "small", reason: (t.evidence.size_reason || "小改动") + "：护栏 + 独立 Verifier + 人初筛已覆盖，不再多调一次 reviewer" },
+    }, false);
+    addEvidence(db, id, {
+      review: { verdict: { verdict: verify.verdict && verify.verdict.verdict || "pass", summary: "已跳过 Agent Reviewer（小改动），结论来自独立 Verifier", raised: [] }, raised: [], diffStat: t.diff_stat, skipped: true, at: new Date().toISOString() },
+    }, "review.result");
+    transition(db, id, "awaiting_review", { actor: ctx.workerId, reason: "ready for first review (reviewer skipped)" });
+    return;
+  }
+
+  const diff = base ? diffPatch(dir, base, 12000) : "";
   const res = await callAgent(db, id, { ...ctx, cwd: dir }, {
     role: "reviewer",
-    prompt: sop.reviewerPrompt({ task: t, plan: t.plan_md || "", diff, testOutput, guards }),
+    prompt: sop.reviewerPrompt({ task: t, plan: t.plan_md || "", diff, guards, verifier: verify.verdict }),
   });
 
   const v = sop.parseVerdict(res.text) || { verdict: "pass", summary: "未给出结构化结论", raised: [] };

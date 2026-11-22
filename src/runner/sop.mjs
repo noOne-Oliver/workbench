@@ -45,10 +45,25 @@ export function coderPrompt(task, plan, attempt, feedback) {
   const lines = [RULES, "",
     "## 角色：Coder（只实现，不自评）",
     "任务：" + task.title,
-    "第 " + (attempt + 1) + " 次尝试。",
-    "", "## 方案", plan, "",
+    "第 " + (attempt + 1) + " 次尝试。"];
+  if (plan && plan.trim()) {
+    lines.push("", "## 方案", plan);
+  } else {
+    // 快路径：没有上游拆解。这时 coder 自己就是方案作者，但必须一次想清楚，别来回试探。
+    lines.push(
+      "",
+      "## 方案（没有上游拆解：这是一个单文件小改动）",
+      "先读需要改的文件和它的测试，想清楚接口形状再动手：",
+      "- 一次写入完整实现，不要先写半成品再回来补；",
+      "- 测试文件只在缺失时新建，已存在就补用例，绝不删改既有断言；",
+      "- 测试最多跑到绿一次，不要反复重跑。",
+    );
+  }
+  lines.push(
+    "",
     "在仓库里完成实现，并补上覆盖该实现的测试。改完自测通过即可。",
-    "不要修改既有测试文件来迁就实现。"];
+    "不要修改既有测试文件来迁就实现。",
+  );
   // 重试必须带上"上一轮为什么没过"，否则就是无脑重试：同样的错会被原样再犯一次。
   if (feedback) lines.push("", "## 上一轮为什么没过（这次必须改掉）", String(feedback));
   return lines.join("\n");
@@ -68,18 +83,30 @@ export function verifierPrompt({ task, diff, testOutput, guards }) {
   ].join("\n");
 }
 
-export function reviewerPrompt({ task, plan, diff, testOutput, guards }) {
-  return [RULES, "",
+/**
+ * Reviewer 复用 Verifier 已经算出来的证据（护栏清单 + 裁决 + 上抛点），
+ * 不再把原始测试输出整段重贴：那一份几千字，重贴一次就是白烧上下文，
+ * 而且它要回答的只有「证据裁决不了什么」，不是「测试过没过」——后者 Verifier 已经答了。
+ */
+export function reviewerPrompt({ task, plan, diff, guards, verifier }) {
+  const v = verifier || {};
+  const lines = [RULES, "",
     "## 角色：Agent Reviewer（只上抛，不做最终决定）",
     "任务：" + task.title,
-    "", "## 方案", plan.slice(0, 4000),
-    "", "## 变更摘要", diff.slice(0, 12000),
-    "", "## 测试输出", testOutput.slice(0, 4000),
-    "", "## 护栏", JSON.stringify(guards.checks, null, 2),
+    "", "## 方案", String(plan || "（快路径：无上游拆解）").slice(0, 4000),
+    "", "## 变更 diff", String(diff || "").slice(0, 12000),
+    "", "## 机器护栏", JSON.stringify(guards.checks, null, 2),
+    "", "## 独立 Verifier 的结论（复用，不要重复判定）",
+    "verdict: " + (v.verdict || "?") + "；summary: " + (v.summary || "（无）"),
+  ];
+  if (Array.isArray(v.raised) && v.raised.length) lines.push("它已经上抛的点：" + v.raised.join("；"));
+  lines.push(
     "",
+    "测试过没过是 Verifier 的事；你只回答「这个改动有没有证据之外的问题」（越界、隐患、和任务不一致）。",
     "只有当证据裁决不了时，才把问题放进 raised 交给人类。",
     "如果证据足够、实现明显正确，verdict 给 pass 且 raised 为空。",
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 /** 从 agent 输出里抠最后一个 JSON verdict 块（支持 ~~~ 与 ``` 两种围栏）。 */
