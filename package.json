@@ -24,6 +24,7 @@
     "demo:real": "node scripts/demo-real-review.mjs --fresh",
     "bench:real": "node scripts/bench-real.mjs --fresh",
     "shot:roles": "node scripts/shot-roles.mjs",
+    "shots": "node scripts/shots.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "build:mac": "bash apps/macshell/build.sh",
     "package:mac": "bash scripts/package-mac.sh",

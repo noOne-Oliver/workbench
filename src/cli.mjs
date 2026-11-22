@@ -56,7 +56,9 @@ async function main() {
     const { pump } = await import("./runner/worker.mjs");
     const engineName = process.env.WB_ENGINE || "mock";
     const provider = await getProvider(engineName);
-    await pump(db, { workerId: arg("worker", hostname() + ":" + process.pid), provider, engine: engineName, once: process.argv.includes("--once") });
+    // WB_WORKER_ID 优先：脚本/截图/测试要能指定一个可预测的身份（默认 hostname:pid 会把机器名写进证据里）
+    const workerId = arg("worker", process.env.WB_WORKER_ID || hostname() + ":" + process.pid);
+    await pump(db, { workerId, provider, engine: engineName, once: process.argv.includes("--once") });
     return;
   }
   if (cmd === "workspace") {

@@ -12,7 +12,8 @@ import { resolve } from "node:path";
 import { ensureWorkspace } from "../src/core/workspace.mjs";
 
 const ROOT = resolve(import.meta.dirname, "..");
-const WS = resolve(ROOT, ".demo/real-review-ws");
+// 路径可配：公开仓库的截图要用中性路径，不能把本机家目录带进图里
+const WS = resolve(process.env.DEMO_WS || resolve(ROOT, ".demo/real-review-ws"));
 const PORT = Number(process.env.DEMO_PORT || 7795);
 const BASE = "http://127.0.0.1:" + PORT;
 const OC_HOME = process.env.WB_OC_HOME || resolve(ROOT, ".oc");
@@ -28,7 +29,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const t0 = Date.now();
 const marks = {};
 
-const childEnv = { ...process.env, WB_ROOT: WS, WB_CODE: ROOT, WB_OC_HOME: OC_HOME, WB_ENGINE: ENGINE, WB_MODEL: MODEL, WB_BUDGET: String(BUDGET) };
+// WB_WORKER_ID 固定成 runner-1：默认身份 hostname:pid 会把本机主机名（含用户名）写进活动流
+const childEnv = { ...process.env, WB_ROOT: WS, WB_CODE: ROOT, WB_OC_HOME: OC_HOME, WB_ENGINE: ENGINE, WB_MODEL: MODEL, WB_BUDGET: String(BUDGET), WB_WORKER_ID: process.env.WB_WORKER_ID || "runner-1" };
 const server = spawn(process.execPath, [resolve(ROOT, "src/server/index.mjs")], {
   cwd: ROOT, env: { ...childEnv, WB_PORT: String(PORT), WB_HOST: "127.0.0.1", WB_ADMIN_NAME: "lead0", WB_TOKEN: "" },
   stdio: ["ignore", "pipe", "pipe"],

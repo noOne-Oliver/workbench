@@ -9,7 +9,8 @@ import { resolve } from "node:path";
 import { ensureWorkspace } from "../src/core/workspace.mjs";
 
 const ROOT = resolve(import.meta.dirname, "..");
-const WS = resolve(ROOT, ".demo/roles-ws");
+// 路径可配：公开仓库的截图要用中性路径（/tmp/...），不能带本机家目录
+const WS = resolve(process.env.SHOT_WS || resolve(ROOT, ".demo/roles-ws"));
 const PORT = Number(process.env.SHOT_PORT || 7794);
 const CDP_PORT = Number(process.env.SHOT_CDP || 9339);
 const BASE = "http://127.0.0.1:" + PORT;
@@ -22,7 +23,8 @@ const ws = ensureWorkspace(WS);
 
 const server = spawn(process.execPath, [resolve(ROOT, "src/server/index.mjs")], {
   cwd: ROOT,
-  env: { ...process.env, WB_ROOT: WS, WB_CODE: ROOT, WB_PORT: String(PORT), WB_HOST: "127.0.0.1", WB_ADMIN_NAME: "lead0", WB_TOKEN: "" },
+  // WB_WORKER_ID：默认身份是 hostname:pid，这台机器的 hostname 带用户名，会漏进活动流截图
+  env: { ...process.env, WB_ROOT: WS, WB_CODE: ROOT, WB_PORT: String(PORT), WB_HOST: "127.0.0.1", WB_ADMIN_NAME: "lead0", WB_TOKEN: "", WB_WORKER_ID: "runner-1" },
   stdio: ["ignore", "pipe", "pipe"],
 });
 let srvOut = "";
@@ -43,7 +45,7 @@ const post = (cookie, path, body) => fetch(BASE + path, {
 const getTask = async (cookie, id) => (await (await fetch(BASE + "/api/tasks/" + id, { headers: { cookie } })).json()).task;
 const runOnce = () => new Promise((res) => {
   const c = spawn(process.execPath, [resolve(ROOT, "src/cli.mjs"), "run", "--once"], {
-    cwd: ROOT, env: { ...process.env, WB_ROOT: WS, WB_ENGINE: "mock" }, stdio: "ignore",
+    cwd: ROOT, env: { ...process.env, WB_ROOT: WS, WB_ENGINE: "mock", WB_WORKER_ID: "runner-1" }, stdio: "ignore",
   });
   c.on("exit", res);
 });

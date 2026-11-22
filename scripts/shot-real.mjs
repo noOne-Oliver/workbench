@@ -86,6 +86,19 @@ const dom = await evalJs(`(() => ({
   live: document.getElementById("n-act")?.textContent,
 }))()`);
 console.log(JSON.stringify(dom, null, 2));
+
+// 公开仓库的截图不能带本机痕迹：家目录、用户名、带用户名的主机名。
+// 截图前先断言，脏图宁可不产出（比事后逐张 OCR 可靠得多）。
+const leak = await evalJs(`(() => {
+  const text = document.body.innerText || "";
+  const needles = ["/Users/", "liujie"];
+  const hit = needles.filter((n) => text.includes(n));
+  return { hit, composeOpen: document.getElementById("compose-box")?.open === true };
+})()`);
+if (leak.hit.length || leak.composeOpen) {
+  throw new Error("截图里有本机痕迹，拒绝写文件: " + JSON.stringify(leak));
+}
+
 const shot = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
 writeFileSync(OUT, Buffer.from(shot.data, "base64"));
 console.log("shot=ok bytes=" + Buffer.from(shot.data, "base64").length + " -> " + OUT);

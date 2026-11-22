@@ -14,7 +14,7 @@
 3. 启动后选一个工作区目录（默认 `~/Workbench`）。它会自己建账本、建起始仓库 `demo/`，并在本机起内核 —— 之后提交任务、后台自动跑、到评审时找你。
 
 ```
-sha256: 136a4d421787155d4fb313b30e3b2df2f1062a38c1e53aaef5783e1d20c5579f  Workbench-0.2.0.zip
+sha256: ddaf261ebc4e440a6bb50f0cc2ceedbf13b31887cdd395b49604e6f2b5ed41a2  Workbench-0.2.0.zip
 ```
 
 自己构建 / 重新打包：
@@ -637,3 +637,7 @@ tests/        内核测试
 scripts/      Web 版启动器（workbench）、demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench / bench-real）、打包复验（verify-package）
 apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView；内核打包进 app，离仓可运行）
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 noOne-Oliver
