@@ -69,3 +69,38 @@ button.ghost { background: transparent; border-color: var(--line); color: var(--
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); display: inline-block; animation: pulse 1.4s ease-in-out infinite; }
 .dot.idle { background: var(--dim); animation: none; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+/* ---- 改动 diff：按文件分组 + 行号，行不再塞进带 max-height 的 <pre> ---- */
+.diffbar { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+.diffbar > span { font-size: 12px; color: var(--dim); }
+.dfile { border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; overflow: hidden; }
+.dfile > summary { display: flex; gap: 8px; align-items: center; padding: 5px 8px; background: #11171f; }
+.dfile .fname { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--fg); }
+.plus { color: #7ee787; font-size: 11px; }
+.minus { color: #ffa198; font-size: 11px; }
+.dim { color: var(--dim); font-size: 11px; }
+.dlines { background: #0b0f14; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; line-height: 1.5; }
+.dlrow { display: grid; grid-template-columns: 46px 46px 1fr; }
+.dlrow .ln { color: #4b5563; text-align: right; padding-right: 6px; user-select: none; border-right: 1px solid #151b23; }
+.dlrow .dlt { white-space: pre-wrap; word-break: break-word; padding-left: 8px; }
+.dlrow .mark { opacity: .55; margin-right: 6px; }
+.dlrow.a .dlt { color: #7ee787; background: rgba(63,185,80,.08); }
+.dlrow.d .dlt { color: #ffa198; background: rgba(248,81,73,.08); }
+.dlrow.h .dlt { color: #79c0ff; background: #0e1620; }
+.dlines.only .dlrow.c { display: none; }
+
+/* ---- 测试用例清单 ---- */
+.cases { list-style: none; margin: 6px 0 0; padding: 0; font-size: 12px; }
+.cases li { padding: 2px 0; border-bottom: 1px solid #151b23; }
+.cases li .mark { display: inline-block; width: 14px; }
+.cases li.yes .mark { color: #7ee787; }
+.cases li.no .mark { color: #ffa198; }
+.cases .why { color: #8b949e; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px; padding-left: 16px; white-space: pre-wrap; }
+.cases-box { margin-top: 8px; }
+
+/* ---- 全屏原始输出：只有一层滚动，滚轮能到底 ---- */
+dialog#raw-viewer { width: 92vw; height: 88vh; max-width: none; padding: 0; background: #0d1218; color: var(--fg); border: 1px solid var(--line); border-radius: 10px; }
+dialog#raw-viewer::backdrop { background: rgba(0,0,0,.62); }
+.rv-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12px; }
+dialog#raw-viewer pre { max-height: none; height: calc(88vh - 46px); margin: 0; border: 0; border-radius: 0; }
+

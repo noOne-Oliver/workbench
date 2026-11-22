@@ -89,6 +89,8 @@ npm test                                           # 内核测试（状态机/�
 | `WB_NO_NPM` | 空 | 设成 1 强制让护栏走 `node --test`，用来复现「机器上没有 npm」的退路 |
 | `WB_HEARTBEAT_MS` | `15000` | 每跑一个 agent 多久落一次心跳（`agent.heartbeat`），界面靠它显示「已跑 1m23s」 |
 | `WB_SILENT_MS` | `60000` | 多久没有事件就判「worker 可能已停」并在卡片上报警 |
+| `WB_NO_BASELINE` | 空 | 设成 1 关掉回归基线对比（没有 git 历史时用），此时 `no_regression` 只验证当前全绿 |
+| `WB_PARENT_PID` | 空 | app 注入：内核发现 `ppid` 不是它就自己收工。防 `kill -9` 之后留下孤儿内核（手动起时不用设） |
 
 ## 五条验收怎么复现
 
@@ -194,10 +196,14 @@ WB_SHELL_SHOT=docs/shell-shot.png dist/Workbench.app/Contents/MacOS/Workbench
 
 边界：ad-hoc 签名只能本机跑（无公证、无 App Sandbox）；`kernel/node` 是 homebrew 的动态链接版，换机器要重新 `build.sh`。详见 [docs/shell.md](docs/shell.md)。
 
-打包有没有真的可用，跑一条命令就知道（它会拿 `.app` 当已安装产物、故意在 `/tmp` 里起、提交一个任务、等它到待裁决、再确认退出不留孤儿）：
+打包有没有真的可用，跑一条命令就知道：它会拿 `.app` 当已安装产物、故意在 `/tmp` 里起、提交一个任务、等它到待裁决，然后**分别**用 SIGTERM 和 `kill -9` 收工两次，确认端口都关掉、不留孤儿内核。
 
 ```bash
-npm run verify:package -- --port 7641   # PASS 离仓可运行 / 工作区正确 / worker 真跑 / 退出无孤儿
+npm run verify:package -- --port 7641
+# states=queued → verifying → awaiting_human
+# SIGTERM：端口已关闭
+# SIGKILL：3.0 秒后内核自己收工，没留孤儿
+# PASS 离仓可运行 / 工作区正确 / worker 真跑 / SIGTERM 干净 / kill -9 无孤儿
 ```
 
 ## 重试闭环（护栏 FAIL → 打回 → 重做 → 通过）
@@ -253,6 +259,50 @@ curl -s '127.0.0.1:7317/api/activity?limit=20' | jq '{cursor, live, events: [.ev
 
 实跑（mock，`WB_MOCK_DELAY=20000` 让 coder 慢下来好截图）：`live={"role":"coder","state":"implementing","elapsed_s":9,"silent_s":3,"stalled":false}`，同屏事件 `attempt.started → agent.started → agent.heartbeat → budget.spent → agent.finished`，回归用例见 `tests/activity.test.mjs`（4 条，含「心跳不打断计时」「120 秒后 stalled=true」）。
 
+## Review 界面：测试清单、回归基线、看得懂的 diff
+
+用户原话（`m01493`）：「测试输出的时候 我没有办法稳定 用鼠标滚轮完全看完所有 测试用例，而且编排不太容易看出来哪里 修改了，我这么改对不对，而且是不是也会跑回归测试去做验证?」——三个问题对应三处改动。
+
+### 1) 滚轮能到底
+
+旧 CSS 把测试输出塞进 `pre { max-height: 220px; overflow: auto }`，而这个 `pre` 又在一层可滚动的 `main` 里：双滚动条，滚轮划到内层就卡住，长输出根本看不完。现在卡片里的 diff / 用例都是普通文档流，**页面只有一层滚动**；「全屏看原始输出」开的是原生 `<dialog>`（`92vw × 88vh`，`pre` 高度 `calc(88vh - 46px)` 且 `max-height: none`），滚轮一条道到底。
+
+### 2) 看得出改了哪
+
+diff 从「一整段带颜色的文本」改成按文件分组 + 双列行号：
+
+- `diffSection()` 以 `diff --git` 切文件，每个文件一个 `<details>`，标题是文件名 + `+N −M`（`+0 −0` 时显示「只有上下文，没改动」）
+- 每行 grid 三列：**旧行号 | 新行号 | 内容**，行首标 `+` / `−` / `@@`
+- 「只看改动」一键隐藏 `@@` 上下文行（`.dlines.only .dlrow.c { display: none }`），只留增删行
+
+### 3) 真跑回归
+
+`tests_pass` 回答「当前代码全绿吗」，`no_regression` 回答「跟 base 提交比，有没有原来绿的变红」。后者：`git -C <worktree> archive <base> | tar -x -C <tmpdir>` 把 base 的树展开到临时目录，用**同一条测试命令**再跑一遍，两边 `parseTestCases()` 解析出用例名单后 `compareBaseline()` 对比。
+
+| 结论 | 含义 |
+| --- | --- |
+| `regressions` | base 过、现在挂 → 直接 FAIL，detail 列「原来能过的用例现在挂了: …」 |
+| `fixed` | base 挂、现在过 |
+| `added` / `removed` | 新增 / 删掉的用例 |
+| 基线本身不绿 | base 里就有 N 条本就挂 → 不算这次回退，detail 如实写「基线本身有 N 条本就失败」 |
+
+`WB_NO_BASELINE=1` 关掉基线（没有 git 历史时用），此时 detail 写「没有取到基线…本次只验证当前全绿」，不假装验证过。
+
+**这次抓到的假绿**：从 `node --test` 里再 `spawn` 一个 `node --test`，子进程会继承 `NODE_TEST_CONTEXT=child-v8`，于是它**直接退出 0**——失败用例被当成通过，基线永远全绿。修法是在 `runSuite()` 里先 `delete env.NODE_TEST_CONTEXT`（`src/runner/guards.mjs`）。用例见 `tests/regression.test.mjs`。
+
+实跑（mock，任务 `t_mwrrl0tu0n1kc`，attempts=2）：
+
+```json
+testCases {"total":5,"pass":5,"fail":0,"names":["+add","+sub","+mul","+div","+unknown op throws"]}
+baseline  {"ok":false,"pass":0,"fail":4,"regressions":[],"fixed":["add","sub","mul","div"],"added":["unknown op throws"]}
+```
+
+（`sandbox/demo` 的 base 是桩代码，4 条用例本来就挂，所以是 `fixed=4` 而不是 `regressions`。）
+
+![review 界面：测试清单 + 回归 + 按文件分组的 diff](docs/review-diff.png)
+
+![全屏原始输出：只有一层滚动](docs/review-raw.png)
+
 ## v0 不做什么（故意的）
 
 - 不做多人实时协作（多租户 = 5 倍工作量）；多人场景先用「一台 Mac 当 runner + 内网 + 单 token」，owner 绑唯一 reviewer。
@@ -265,7 +315,7 @@ curl -s '127.0.0.1:7317/api/activity?limit=20' | jq '{cursor, live, events: [.ev
 src/core/     账本、事件、状态机、租约、工作区（workspace.mjs）、活动流（activity.mjs）
 src/runner/   worker 循环、SOP 提示词、护栏、worktree、引擎 provider
 src/server/   HTTP + 静态审阅界面
-web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档 + 新建任务表单）
+web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档 + 新建任务表单 + 按文件分组的 diff / 测试清单 / 全屏原始输出）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
 scripts/      demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）、打包复验（verify-package）

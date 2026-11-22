@@ -284,6 +284,8 @@ enum WorkspaceProvisioner {
         env["WB_ROOT"] = workspace.path
         env["WB_CODE"] = paths.root.path
         env["WB_DB"] = workspace.appendingPathComponent("data/ledger.db").path
+        // 子进程看门狗：app 被 kill -9 时没人通知它们退出，内核靠 ppid 变化自己收工（src/core/orphan.mjs）。
+        env["WB_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         // 真引擎的凭据/配置属于工作区，不属于 app 包：显式指过去（外部已设 WB_OC_HOME 时听外部的）。
         if env["WB_OC_HOME"] == nil || env["WB_OC_HOME"]!.isEmpty {
             env["WB_OC_HOME"] = workspace.appendingPathComponent(".oc").path

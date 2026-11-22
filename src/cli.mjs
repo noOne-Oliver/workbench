@@ -51,6 +51,8 @@ async function main() {
     return;
   }
   if (cmd === "run") {
+    const { watchParent } = await import("./core/orphan.mjs");
+    watchParent({ log: (m) => process.stderr.write("[worker] " + m + "\n") });
     const { pump } = await import("./runner/worker.mjs");
     const provider = await getProvider(process.env.WB_ENGINE || "mock");
     await pump(db, { workerId: arg("worker", hostname() + ":" + process.pid), provider, once: process.argv.includes("--once") });

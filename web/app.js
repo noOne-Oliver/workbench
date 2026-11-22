@@ -59,17 +59,114 @@ function describe(e) {
   }
 }
 
-function diffBlock(diff) {
-  const lines = String(diff).split("\n");
-  const shown = lines.slice(0, 400).map((ln) => {
-    const cls = ln.startsWith("+++") || ln.startsWith("---") ? "f"
-      : ln.startsWith("+") ? "a"
-      : ln.startsWith("-") ? "d"
-      : ln.startsWith("@@") ? "h" : "";
-    return '<span class="dl ' + cls + '">' + esc(ln) + "</span>";
+// ---- 改动 diff：按文件分组、带行号、可只看改动 ----
+// 之前是一整块 <pre>（max-height 220px），一屏只能看到几行，还套在页面的滚动里，
+// 滚轮根本划不到头。现在每一行是独立的行，页面只有一层滚动。
+
+function parseDiff(text) {
+  const files = [];
+  let cur = null;
+  for (const ln of String(text || "").split("\n")) {
+    if (ln.startsWith("diff --git ")) {
+      const m = / b\/(.+)$/.exec(ln);
+      cur = { path: m ? m[1] : ln.slice(11), add: 0, del: 0, o: 0, n: 0, rows: [] };
+      files.push(cur);
+      continue;
+    }
+    if (!cur || ln === "\ No newline at end of file") continue;
+    if (ln.startsWith("@@")) {
+      const m = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(ln);
+      if (m) { cur.o = Number(m[1]); cur.n = Number(m[2]); }
+      cur.rows.push({ t: "h", text: ln });
+      continue;
+    }
+    if (/^(index |--- |\+\+\+ |new file|deleted file|old mode|new mode|similarity|rename |Binary )/.test(ln)) continue;
+    const t = ln[0] === "+" ? "a" : ln[0] === "-" ? "d" : "c";
+    const row = { t, text: ln.slice(1) };
+    if (t === "a") { row.n = cur.n; cur.n += 1; cur.add += 1; }
+    else if (t === "d") { row.o = cur.o; cur.o += 1; cur.del += 1; }
+    else { row.o = cur.o; row.n = cur.n; cur.o += 1; cur.n += 1; }
+    cur.rows.push(row);
+  }
+  return files;
+}
+
+function diffRow(r) {
+  if (r.t === "h") {
+    return '<div class="dlrow h"><span class="ln"></span><span class="ln"></span><span class="dlt">' + esc(r.text) + "</span></div>";
+  }
+  const mark = r.t === "a" ? "+" : r.t === "d" ? "−" : " ";
+  return '<div class="dlrow ' + r.t + '"><span class="ln">' + (r.o == null ? "" : r.o) + '</span><span class="ln">' +
+    (r.n == null ? "" : r.n) + '</span><span class="dlt"><span class="mark">' + esc(mark) + "</span>" + esc(r.text) + "</span></div>";
+}
+
+function diffSection(diff) {
+  const files = parseDiff(diff);
+  if (!files.length) return "";
+  const body = files.map((f) => {
+    const changed = f.rows.some((r) => r.t !== "c");
+    return '<details class="dfile" open><summary><span class="fname">' + esc(f.path) + "</span>" +
+      '<span class="plus">+' + f.add + '</span><span class="minus">−' + f.del + "</span>" +
+      (changed ? "" : '<span class="dim">（只有上下文，没改动）</span>') + "</summary>" +
+      '<div class="dlines">' + f.rows.map(diffRow).join("") + "</div></details>";
   }).join("");
-  const more = lines.length > 400 ? '<span class="dl h">… 还有 ' + (lines.length - 400) + " 行</span>" : "";
-  return shown + more;
+  return '<div class="diffbar"><span>改动 diff</span>' +
+    '<button class="ghost" onclick="toggleCtx(this)">只看改动</button></div>' + body;
+}
+
+function toggleCtx(btn) {
+  const only = btn.dataset.on !== "1";
+  btn.dataset.on = only ? "1" : "0";
+  btn.textContent = only ? "显示全部上下文" : "只看改动";
+  document.querySelectorAll(".dlines").forEach((d) => d.classList.toggle("only", only));
+}
+
+// ---- 测试结果：用例清单（失败的置顶）+ 回归对比 ----
+function caseList(cases) {
+  return '<ul class="cases">' + cases.map((c) =>
+    '<li class="' + (c.ok ? "yes" : "no") + '"><span class="mark">' + (c.ok ? "✓" : "✗") + "</span>" +
+    '<span class="nm">' + esc(c.name) + "</span>" +
+    (c.detail && c.detail.length ? '<div class="why">' + esc(c.detail.slice(0, 2).join(" ")) + "</div>" : "") +
+    "</li>").join("") + "</ul>";
+}
+
+function testSection(v, id) {
+  const tc = v.testCases;
+  const b = v.baseline;
+  const out = [];
+  if (tc && tc.total) {
+    out.push('<div class="row">测试 <b>' + tc.total + "</b> 条 · " +
+      '<span class="ok">' + tc.pass + " 通过</span>" +
+      (tc.fail ? ' · <span class="bad">' + tc.fail + " 失败</span>" : "") + "</div>");
+    const failed = tc.cases.filter((c) => !c.ok);
+    if (failed.length) out.push(caseList(failed));
+    const passed = tc.cases.filter((c) => c.ok);
+    if (passed.length) {
+      out.push('<details class="cases-box"><summary>通过的 ' + passed.length + " 条用例</summary>" + caseList(passed) + "</details>");
+    }
+  }
+  if (b) {
+    out.push('<div class="row">回归：' + (b.regressions.length
+      ? '<span class="bad">' + b.regressions.length + " 条回退（" + esc(b.regressions.slice(0, 4).join("、")) + "）</span>"
+      : '<span class="ok">0 条回退</span>') +
+      " · 既有 " + b.pass + " 条绿" +
+      (b.added.length ? " · 新增 " + b.added.length + " 条" : "") +
+      (b.fixed.length ? " · 修好 " + b.fixed.length + " 条" : "") +
+      (b.ok ? "" : " · 基线本身有 " + b.fail + " 条失败") + "</div>");
+  } else if (tc && tc.total) {
+    out.push('<div class="row dim">回归：没取到基线（base 提交里没有测试），只验证了当前全绿</div>');
+  }
+  if (v.testOutputTail) out.push('<button class="ghost" onclick="openRaw(\'' + id + '\')">全屏看原始输出</button>');
+  return out.join("");
+}
+
+function openRaw(id) {
+  const t = tasks.find((x) => x.id === id);
+  const ev = (t && t.evidence) || {};
+  const v = ev.verify || {};
+  el("rv-title").textContent = "测试原始输出 · " + (t ? t.title : id) + (v.testCmd ? "（" + v.testCmd + "）" : "");
+  el("rv-body").textContent = v.testOutputTail || "（没有输出）";
+  el("raw-viewer").showModal();
 }
 
 async function load() {
@@ -118,8 +215,8 @@ function card(t, actionable) {
     (v.verdict ? '<div class="row">Verifier: <span class="badge ' + (v.passed ? "ok" : "bad") + '">' + esc(v.verdict.summary || "") + "</span></div>" : "") +
     (checks ? '<details><summary>机器护栏 (' + (v.guards || []).filter((c) => c.ok).length + "/" + (v.guards || []).length + ')</summary><ul class="checks">' + checks + "</ul></details>" : "") +
     (raised ? '<div class="row">初审上抛：</div><ul class="raised">' + raised + "</ul>" : "") +
-    (v.diff ? '<details open><summary>改动 diff</summary><pre class="diff">' + diffBlock(v.diff) + "</pre></details>" : "") +
-    (v.testOutputTail ? '<details><summary>测试输出</summary><pre>' + esc(v.testOutputTail) + "</pre></details>" : "") +
+    (v.diff ? diffSection(v.diff) : "") +
+    testSection(v, t.id) +
     (ev.last_error ? '<div class="row" style="color:var(--bad)">最近错误: ' + esc(ev.last_error) + "</div>" : "") +
     (actionable && t.owner && ME !== t.owner ?
       '<div class="row" style="color:var(--warn)">这个任务归 ' + esc(t.owner) + " 裁决，当前身份是 " + esc(ME) + "（右上角可改）</div>" : "") +
@@ -204,6 +301,9 @@ window.watch = function (id) {
   loadFeed();
 };
 window.clearFilter = function () { filterTask = null; feed = []; cursor = 0; loadFeed(); };
+// 模块作用域的函数不会自动挂到 window 上，内联 onclick 找不到它们（这里显式导出）
+window.toggleCtx = toggleCtx;
+window.openRaw = openRaw;
 
 window.decide = async function (id, decision) {
   const note = (document.getElementById("note-" + id) || {}).value || "";

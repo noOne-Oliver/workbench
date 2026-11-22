@@ -5,6 +5,7 @@ import { openDb } from "../core/db.mjs";
 import { createTask, getTask, listTasks, transition, record, addEvidence } from "../core/ledger.mjs";
 import { readForTask } from "../core/events.mjs";
 import { feed as readFeed, live as readLive } from "../core/activity.mjs";
+import { watchParent } from "../core/orphan.mjs";
 
 // ROOT = 工作区（账本、worktrees、凭据都写这里）；CODE = 内核代码目录（打包后是 app 内的 Resources/kernel）。
 // 两者分开，才能把内核塞进 .app 而数据留在用户自己的工作区。
@@ -130,6 +131,7 @@ export function createApp(db) {
 }
 
 export function startServer() {
+  watchParent({ log: (m) => process.stderr.write("[server] " + m + "\n") });
   const db = openDb();
   const server = createServer(createApp(db));
   server.listen(PORT, HOST, () => {

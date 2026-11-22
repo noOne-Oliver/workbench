@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sh } from "./worktree.mjs";
 
@@ -27,6 +28,18 @@ export function testCommandFor(cfg, opts) {
   const cmd = Array.isArray(raw) ? raw.slice() : String(raw).split(/\s+/).filter(Boolean);
   if (cmd[0] !== "npm" || npmOk) return { cmd, note: "" };
   return { cmd: [process.execPath, "--test"], note: "本机没有可用的 npm，已退回 node --test；" };
+}
+
+/**
+ * 跑仓库的整套测试。
+ * 必须清掉 NODE_TEST_CONTEXT：从 node --test 里再起 node --test（我们自己的测试就是这么跑的），
+ * 子进程会以为自己是被调度的测试子进程，直接退出 0 —— 失败用例被当成通过。
+ */
+function runSuite(dir, cfg) {
+  const { cmd } = testCommandFor(cfg);
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  return sh(cmd[0], cmd.slice(1), { cwd: dir, timeout: cfg.testTimeoutMs || DEFAULTS.testTimeoutMs, env });
 }
 
 export function loadRepoConfig(workdir) {
@@ -64,6 +77,81 @@ function gitShow(dir, ref, path) {
 function testOutputTail(dir, base) {
   const r = sh("git", ["-C", dir, "diff", base + "..HEAD", "--", "*/test/*", "test/*"]);
   return r.ok ? r.out.slice(0, 4000) : "";
+}
+
+/**
+ * 把测试输出解析成用例清单（node --test 的 TAP 与 mocha 风格都认）。
+ * 只负责"人能不能看懂哪条挂了"，判定仍然只看退出码。
+ */
+export function parseTestCases(out) {
+  const cases = [];
+  let cur = null;
+  const push = (name, ok) => {
+    cur = { name, ok, detail: [] };
+    cases.push(cur);
+  };
+  for (const raw of String(out || "").split("\n")) {
+    if (!raw.trim()) continue;
+    const tap = /^(not ok|ok)\b\s*(?:\d+\s*)?(?:-\s*)?(.*)$/.exec(raw.trim());
+    if (tap) {
+      const name = tap[2].replace(/\s+#.*$/, "").trim();
+      if (!name || /^tests?$/.test(name)) { cur = null; continue; }
+      push(name, tap[1] === "ok");
+      continue;
+    }
+    const mocha = /^(✓|✗|✖|√)\s+(.*)$/.exec(raw.trim());
+    if (mocha) { push(mocha[2].trim(), mocha[1] === "✓" || mocha[1] === "√"); continue; }
+    if (/^(#|1\.\.)/.test(raw.trim())) { cur = null; continue; }
+    if (cur && !cur.ok && cur.detail.length < 4) {
+      const t = raw.trim();
+      if (/^(error|Error|AssertionError|expected|actual|at |code:|name:)/.test(t)) cur.detail.push(t.slice(0, 400));
+    }
+  }
+  const pass = cases.filter((c) => c.ok).length;
+  return { total: cases.length, pass, fail: cases.length - pass, cases };
+}
+
+/** 纯函数：把「基线跑出来的用例」与「这次跑出来的用例」对照出四类差异。 */
+export function compareBaseline(baseCases, nowCases) {
+  const names = (list) => new Set(list.map((c) => c.name));
+  const basePass = names(baseCases.filter((c) => c.ok));
+  const baseFail = names(baseCases.filter((c) => !c.ok));
+  const nowPass = names(nowCases.filter((c) => c.ok));
+  const nowFail = names(nowCases.filter((c) => !c.ok));
+  const allNow = names(nowCases);
+  return {
+    // 回退 = 原来过、现在挂。用例被改名/删掉不算回退（那是对不上名字），单列在 removed 里给人看
+    regressions: [...basePass].filter((n) => nowFail.has(n)),
+    fixed: [...baseFail].filter((n) => nowPass.has(n)),
+    added: [...allNow].filter((n) => !basePass.has(n) && !baseFail.has(n)),
+    removed: [...basePass].filter((n) => !allNow.has(n)),
+    basePassCount: basePass.size,
+    baseFailCount: baseFail.size,
+  };
+}
+
+/**
+ * 基线：把 base 提交原样展开到临时目录跑一遍测试，得到「改动之前哪些用例是绿的」。
+ * 没有基线就只能说"现在全绿"，说不出"这次改动有没有弄坏原来能用的东西"。
+ * 用 git archive 而不是 worktree：不注册、不留残枝，也不用 --force 清理。
+ */
+export function baselineSnapshot({ workdir, base, config }) {
+  if (process.env.WB_NO_BASELINE === "1") return null;
+  const cfg = config || loadRepoConfig(workdir);
+  const tree = sh("git", ["-C", workdir, "ls-tree", "-r", "--name-only", base]);
+  const hasTests = tree.ok && tree.out.split("\n").some((p) => TEST_FILE_RE.test(p));
+  if (!hasTests) return null;
+  const tmp = mkdtempSync(join(tmpdir(), "wb-base-"));
+  try {
+    const cmd = "git -C " + JSON.stringify(workdir) + " archive " + JSON.stringify(base) + " | tar -x -C " + JSON.stringify(tmp);
+    if (!sh("/bin/sh", ["-c", cmd]).ok) return null;
+    const run = runSuite(tmp, cfg);
+    return { ...parseTestCases(run.out), ok: run.ok, exitCode: run.code };
+  } catch {
+    return null;
+  } finally {
+    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
 }
 
 
@@ -218,13 +306,35 @@ export function runGuards({ workdir, base, config, extra }) {
   const checks = [];
   const files = changedFiles(workdir, base);
 
-  // 1. 测试必须真的跑，且真的绿
+  // 1. 测试必须真的跑，且真的绿（跑的是仓库整套测试，不是只跑新增那条）
   const { cmd, note } = testCommandFor(cfg);
-  const run = sh(cmd[0], cmd.slice(1), { cwd: workdir, timeout: cfg.testTimeoutMs || DEFAULTS.testTimeoutMs });
+  const run = runSuite(workdir, cfg);
+  const now = parseTestCases(run.out);
+  const caseNote = now.total ? "（" + now.total + " 条用例：" + now.pass + " 过" + (now.fail ? "，" + now.fail + " 挂" : "") + "）" : "";
   checks.push({
     id: "tests_pass",
     ok: run.ok,
-    detail: note + (run.ok ? "测试命令退出码 0" : "测试命令失败（exit " + run.code + "）"),
+    detail: note + (run.ok ? "整套测试退出码 0" + caseNote : "测试命令失败（exit " + run.code + "）" + caseNote),
+  });
+
+  // 1b. 回归：拿 base 提交跑一遍做基线，看有没有"原来能过、现在挂了"的用例。
+  //     只跑当前代码看不出回归——那正是人 review 时最该被机器顶掉的一步。
+  let baseline = null;
+  try { baseline = baselineSnapshot({ workdir, base, config: cfg }); } catch { baseline = null; }
+  const cmp = baseline ? compareBaseline(baseline.cases, now.cases) : null;
+  checks.push({
+    id: "no_regression",
+    ok: !cmp || cmp.regressions.length === 0,
+    detail: !cmp
+      ? "没有取到基线（WB_NO_BASELINE=1 或 base 提交里没有测试），本次只验证当前全绿"
+      : cmp.regressions.length
+        ? "原来能过的用例现在挂了: " + cmp.regressions.slice(0, 5).join("；") +
+          (cmp.regressions.length > 5 ? " 等 " + cmp.regressions.length + " 条" : "")
+        : "既有 " + cmp.basePassCount + " 条用例全绿" +
+          (cmp.added.length ? "，新增 " + cmp.added.length + " 条" : "") +
+          (cmp.fixed.length ? "，修好 " + cmp.fixed.length + " 条" : "") +
+          (cmp.removed.length ? "，删掉了 " + cmp.removed.length + " 条原本能过的（改名也算，看 diff 确认）: " + cmp.removed.slice(0, 3).join("；") : "") +
+          (baseline.ok ? "" : "（基线本身有 " + baseline.fail + " 条本就失败，不算这次改动）"),
   });
 
   // 2. 不许把测试改弱：删文件、或断言/用例数变少都算削弱。
@@ -351,5 +461,18 @@ export function runGuards({ workdir, base, config, extra }) {
     testOutput: String(run.out || "").slice(-12000),
     testCmd: cmd.join(" "),
     testDiff: testOutputTail(workdir, base),
+    // 给界面用：用例清单 + 基线对比（都是"人能不能看懂"，不参与判定）
+    testCases: { total: now.total, pass: now.pass, fail: now.fail, cases: now.cases.slice(0, 300) },
+    baseline: cmp
+      ? {
+        ok: baseline.ok,
+        pass: cmp.basePassCount,
+        fail: cmp.baseFailCount,
+        regressions: cmp.regressions,
+        fixed: cmp.fixed,
+        added: cmp.added,
+        removed: cmp.removed,
+      }
+      : null,
   };
 }

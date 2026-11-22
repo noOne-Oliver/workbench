@@ -8,6 +8,7 @@ export function sh(cmd, args, opts) {
     const out = execFileSync(cmd, args, {
       cwd: o.cwd, encoding: "utf8", timeout: o.timeout || 180000,
       stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024,
+      ...(o.env ? { env: o.env } : {}),
     });
     return { ok: true, out: out || "", code: 0 };
   } catch (e) {

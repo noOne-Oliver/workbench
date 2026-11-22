@@ -48,6 +48,10 @@
     </h2>
     <ol id="events" class="events"></ol>
   </section>
+  <dialog id="raw-viewer">
+    <div class="rv-head"><b id="rv-title"></b><button class="ghost" onclick="document.getElementById('raw-viewer').close()">关闭</button></div>
+    <pre id="rv-body"></pre>
+  </dialog>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

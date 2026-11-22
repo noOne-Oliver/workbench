@@ -279,6 +279,8 @@ async function doVerify(db, id, ctx) {
       guards: guards.checks,
       guardsFailed: guards.failed,
       testCmd: guards.testCmd,
+      testCases: guards.testCases || null,
+      baseline: guards.baseline || null,
       testOutputTail: guards.testOutput.slice(-3000),
       diff: String(diff || "").slice(0, 12000),
       verdict: v,
