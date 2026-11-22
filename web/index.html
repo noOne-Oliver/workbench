@@ -41,6 +41,13 @@
       <div id="done" class="cards"></div>
     </section>
   </main>
+  <section id="activity-panel">
+    <h2>后台在跑什么 <span id="n-act" class="pill">0</span>
+      <button id="filter-chip" class="ghost" onclick="clearFilter()" style="display:none"></button>
+      <span class="hint">每 2.5 秒刷新 · 心跳 15 秒一次 · 静默 60 秒判死</span>
+    </h2>
+    <ol id="events" class="events"></ol>
+  </section>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

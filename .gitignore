@@ -1,6 +1,7 @@
 data/
 worktrees/
 sandbox/
+demo/
 .bench/
 .oc/
 *.log

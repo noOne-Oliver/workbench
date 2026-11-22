@@ -73,28 +73,67 @@ export async function runTask(db, id, ctx) {
   return getTask(db, id);
 }
 
+/**
+ * 一次 agent 调用。
+ * 人不在终端前面，所以"现在是谁在跑、跑了多久、有没有动静"必须落成事件：
+ * agent.started / agent.heartbeat / agent.finished。没有这三条，界面只能给一个状态徽章，
+ * 分不清"在思考"和"进程已经死了"——那正是值班员的活。
+ */
 async function callAgent(db, id, ctx, { role, prompt, attempt }) {
   const t = getTask(db, id);
   if (overBudget(t)) {
     transition(db, id, "blocked", { actor: ctx.workerId, reason: "budget exhausted" });
     throw new Error("budget exhausted");
   }
+  const zeroBased = attempt === undefined ? Math.max(0, t.attempts - 1) : attempt;
+  const startedMs = Date.now();
+  record(db, {
+    taskId: id, type: "agent.started", actor: ctx.workerId,
+    payload: { role, attempt: zeroBased, prompt_chars: prompt.length },
+  }, false);
+
   const timer = setInterval(() => renew(db, id, ctx.workerId, 300000), 60000);
+  const beat = setInterval(() => {
+    record(db, {
+      taskId: id, type: "agent.heartbeat", actor: ctx.workerId,
+      payload: { role, elapsed_s: Math.round((Date.now() - startedMs) / 1000) },
+    }, false);
+  }, Number(process.env.WB_HEARTBEAT_MS || 15000));
   if (timer.unref) timer.unref();
+  if (beat.unref) beat.unref();
+
+  let res = null;
+  let thrown = null;
   try {
-    const zeroBased = attempt === undefined ? Math.max(0, t.attempts - 1) : attempt;
-    const res = await ctx.provider.run({ role, prompt, cwd: ctx.cwd, task: t, attempt: zeroBased });
+    res = await ctx.provider.run({ role, prompt, cwd: ctx.cwd, task: t, attempt: zeroBased });
     if (res && res.tokens) spendBudget(db, id, res.tokens, { role });
-    if (!res || !res.ok) {
-      const err = new Error((role + " 调用失败: ") + (res && res.error || "unknown"));
-      // 引擎自己判定"再试也一样"的（权限、凭据、模型不存在），不该再烧掉五轮预算。
-      err.fatal = !!(res && res.fatal);
-      throw err;
-    }
-    return res;
+  } catch (e) {
+    thrown = e;
   } finally {
     clearInterval(timer);
+    clearInterval(beat);
   }
+
+  record(db, {
+    taskId: id, type: "agent.finished", actor: ctx.workerId,
+    payload: {
+      role,
+      ok: !thrown && !!(res && res.ok),
+      tokens: (res && res.tokens) || 0,
+      ms: Date.now() - startedMs,
+      error: thrown ? String(thrown && thrown.message || thrown).slice(0, 200)
+        : (res && res.ok ? null : String(res && res.error || "unknown").slice(0, 200)),
+    },
+  }, false);
+
+  if (thrown) throw thrown;
+  if (!res || !res.ok) {
+    const err = new Error((role + " 调用失败: ") + (res && res.error || "unknown"));
+    // 引擎自己判定"再试也一样"的（权限、凭据、模型不存在），不该再烧掉五轮预算。
+    err.fatal = !!(res && res.fatal);
+    throw err;
+  }
+  return res;
 }
 
 /** 规划阶段的沙箱：真引擎会真的写文件，绝不能让 lead/architect 以仓库根为 cwd。 */

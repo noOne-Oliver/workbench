@@ -87,6 +87,8 @@ npm test                                           # 内核测试（状态机/�
 | `WB_CODE` | 同 `WB_ROOT` | **代码根**：`web/` 从 `WB_CODE/web` 取。打包成 app 后这两个不是一回事，见「桌面外壳」 |
 | `WB_WORKSPACE` | 空 | app 用：工作区目录（优先级最高，压过 UserDefaults 里存的选择） |
 | `WB_NO_NPM` | 空 | 设成 1 强制让护栏走 `node --test`，用来复现「机器上没有 npm」的退路 |
+| `WB_HEARTBEAT_MS` | `15000` | 每跑一个 agent 多久落一次心跳（`agent.heartbeat`），界面靠它显示「已跑 1m23s」 |
+| `WB_SILENT_MS` | `60000` | 多久没有事件就判「worker 可能已停」并在卡片上报警 |
 
 ## 五条验收怎么复现
 
@@ -227,6 +229,30 @@ verify PASS 全绿                        verifier  47988 token
 
 这条演示在写的时候**真的抓出一个假绿**：`src/runner/guards.mjs` 过去只有在实现函数里存在"调用"（`Math.pow`、同文件辅助函数）时才检查同义反复；实现只用运算符（`a + b`、`a ** b`）时检查直接短路，`assert.equal(f(x), f(x))` 这种恒真断言完全逃过去。现在「两边是同一表达式」这条判据被提到与实现无关的位置（`sameExpression()`），实现只剩运算符也照抓。回归用例见 `tests/guards-tautology.test.mjs` 最后一条。
 
+## 后台在跑什么（实时活动流）
+
+「人只负责 review」有个隐藏前提：**你得看得见它在干活**。状态徽章只告诉你「实现中」，分不清「模型在思考」和「worker 进程已经死了」——那又变成值班员了。所以每一次 agent 调用都要留下开工、心跳、收工三条记录：
+
+| 事件 | 何时落 | 带什么 |
+| --- | --- | --- |
+| `agent.started` | 每次 `provider.run` 之前 | `role`、`attempt`、`prompt_chars` |
+| `agent.heartbeat` | 每 `WB_HEARTBEAT_MS`（默认 15s） | `role`、`elapsed_s`（只用来证明还活着，界面不逐条刷屏） |
+| `agent.finished` | 无论成功/抛错/超时都落 | `role`、`ok`、`tokens`、`ms`、`error` |
+
+这三条 `apply=false`（不进状态投影，重放时不会改变任务状态），只喂给 `/api/activity`：
+
+```bash
+curl -s '127.0.0.1:7317/api/activity?limit=20' | jq '{cursor, live, events: [.events[] | {type, ts: .ts[11:19]}]}'
+# live: 正在跑的任务此刻在哪个角色、已跑多久、静默了多少秒（超 WB_SILENT_MS 判 stalled）
+# since=<cursor> 只取增量，界面每 2.5 秒拉一次，不重绘整页
+```
+
+界面是常驻底部的一条「后台在跑什么」：事件流 + 每张卡片上的一句「**coder** 正在跑 · 已 1m23s」。静默超时就把那句话换成红色「⚠ 90s 无事件，worker 可能已停」。点卡片上的「看时间线」只看这个任务。
+
+![后台在跑什么](docs/activity-shot.png)
+
+实跑（mock，`WB_MOCK_DELAY=20000` 让 coder 慢下来好截图）：`live={"role":"coder","state":"implementing","elapsed_s":9,"silent_s":3,"stalled":false}`，同屏事件 `attempt.started → agent.started → agent.heartbeat → budget.spent → agent.finished`，回归用例见 `tests/activity.test.mjs`（4 条，含「心跳不打断计时」「120 秒后 stalled=true」）。
+
 ## v0 不做什么（故意的）
 
 - 不做多人实时协作（多租户 = 5 倍工作量）；多人场景先用「一台 Mac 当 runner + 内网 + 单 token」，owner 绑唯一 reviewer。
@@ -236,7 +262,7 @@ verify PASS 全绿                        verifier  47988 token
 ## 目录
 
 ```
-src/core/     账本、事件、状态机、租约、工作区（workspace.mjs）
+src/core/     账本、事件、状态机、租约、工作区（workspace.mjs）、活动流（activity.mjs）
 src/runner/   worker 循环、SOP 提示词、护栏、worktree、引擎 provider
 src/server/   HTTP + 静态审阅界面
 web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档 + 新建任务表单）

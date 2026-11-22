@@ -4,6 +4,7 @@ import { extname, join, resolve } from "node:path";
 import { openDb } from "../core/db.mjs";
 import { createTask, getTask, listTasks, transition, record, addEvidence } from "../core/ledger.mjs";
 import { readForTask } from "../core/events.mjs";
+import { feed as readFeed, live as readLive } from "../core/activity.mjs";
 
 // ROOT = 工作区（账本、worktrees、凭据都写这里）；CODE = 内核代码目录（打包后是 app 内的 Resources/kernel）。
 // 两者分开，才能把内核塞进 .app 而数据留在用户自己的工作区。
@@ -46,6 +47,19 @@ export function createApp(db) {
       if (req.method === "GET" && path === "/api/tasks") {
         const state = url.searchParams.get("state");
         return json(res, 200, { tasks: listTasks(db, { state: state || null }) });
+      }
+      // "后台在跑什么"：增量事件流 + 每个在跑的任务此刻的角色/时长/是否静默。
+      // 界面不该只有状态徽章——状态是结果，事件才是过程。
+      if (req.method === "GET" && path === "/api/activity") {
+        const since = Number(url.searchParams.get("since") || 0);
+        const limit = Number(url.searchParams.get("limit") || 120);
+        const task = url.searchParams.get("task") || null;
+        const events = readFeed(db, { since, limit, task });
+        return json(res, 200, {
+          events,
+          live: readLive(db),
+          cursor: events.length ? events[events.length - 1].id : since,
+        });
       }
       if (req.method === "GET" && path === "/api/workspace") {
         const { credentialStatus } = await import("../core/credentials.mjs");
