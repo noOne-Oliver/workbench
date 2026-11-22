@@ -1,6 +1,8 @@
 // Workbench.swift — 工作台 macOS 桌面外壳
-// 单一 AppKit 窗口 + WKWebView 装已有的三栏审阅收件箱，并托管内核（node src/server/index.mjs）的生命周期。
-// 目标：零第三方依赖 —— 只要 swiftc + 系统框架 + 本机 node。
+// 单一 AppKit 窗口 + WKWebView 装已有的三栏审阅收件箱。
+// 内核（node + src/ + web/）随 app 打包在 Contents/Resources/kernel 里，脱离仓库也能启动；
+// 数据（账本、worktree、起始仓库）写在用户选择的工作区，卸载 app 不会带走。
+// 子进程有两个：server（HTTP + 静态页面）与 worker（常驻任务循环，不启动它任务永远排队）。
 
 import AppKit
 import Darwin
@@ -14,20 +16,25 @@ enum ShellConst {
     static let probeTimeout: TimeInterval = 1.0
     static let probeInterval: TimeInterval = 0.15
     static let bootDeadline: TimeInterval = 15.0
+    static let stopGrace: TimeInterval = 3.0
     static let defaultWidth: CGFloat = 1200
     static let defaultHeight: CGFloat = 800
     static let minWidth: CGFloat = 900
     static let minHeight: CGFloat = 640
     static let autosaveName = "WorkbenchShellWindow"
+    static let workspaceDefaultsKey = "workspace"
+    static let defaultWorkspaceName = "Workbench"
+    static let kernelEnvKey = "WB_KERNEL"
 }
 
-// 兜底：外壳被 SIGTERM/SIGINT 杀掉时，也把自己起的子进程带走，绝不留孤儿。
-var gChildPid: pid_t = 0
+// 兜底：外壳被 SIGTERM/SIGINT 杀掉时，也把自己起的子进程（server + worker）带走，绝不留孤儿。
+// 信号处理器里只碰整数：不能加锁、不能分配内存。
+var gServerPid: pid_t = 0
+var gWorkerPid: pid_t = 0
 
 func shellSignalHandler(_ sig: Int32) {
-    if gChildPid > 0 {
-        kill(gChildPid, SIGKILL)
-    }
+    if gServerPid > 0 { kill(gServerPid, SIGKILL) }
+    if gWorkerPid > 0 { kill(gWorkerPid, SIGKILL) }
     exit(128 + sig)
 }
 
@@ -43,103 +50,304 @@ func envValue(_ key: String) -> String? {
     return v.isEmpty ? nil : v
 }
 
+func expandPath(_ raw: String) -> URL {
+    URL(fileURLWithPath: (raw as NSString).expandingTildeInPath).standardizedFileURL
+}
+
 func isoNow() -> String {
     let f = ISO8601DateFormatter()
     f.timeZone = TimeZone.current
     return f.string(from: Date())
 }
 
-// MARK: - 仓库定位
+// MARK: - 内核定位（app 包内）
 
-enum RepoLocator {
-    static func looksLikeRepo(_ dir: URL) -> Bool {
-        FileManager.default.fileExists(atPath: dir.appendingPathComponent("src/server/index.mjs").path)
-    }
+struct KernelPaths {
+    let root: URL
+    let node: URL
+    let serverEntry: URL
+    let cliEntry: URL
+    /// 内核目录是怎么定下来的（Resources/kernel 或 WB_KERNEL），只用于日志。
+    let source: String
 
-    /// 顺序：WB_REPO → Info.plist 的 WBRepoRoot → 从可执行文件向上找含 src/server/index.mjs 的目录。
-    static func resolve() -> (root: URL?, source: String, tried: [String]) {
-        var tried: [String] = []
-
-        if let p = envValue("WB_REPO") {
-            let u = URL(fileURLWithPath: (p as NSString).expandingTildeInPath).standardizedFileURL
-            tried.append("WB_REPO=\(u.path)")
-            if looksLikeRepo(u) { return (u, "WB_REPO", tried) }
-        }
-
-        if let p = Bundle.main.object(forInfoDictionaryKey: "WBRepoRoot") as? String,
-           !p.trimmingCharacters(in: .whitespaces).isEmpty {
-            let u = URL(fileURLWithPath: (p as NSString).expandingTildeInPath).standardizedFileURL
-            tried.append("Info.plist WBRepoRoot=\(u.path)")
-            if looksLikeRepo(u) { return (u, "Info.plist WBRepoRoot", tried) }
-        }
-
-        let exe = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
-        var dir = exe.resolvingSymlinksInPath().deletingLastPathComponent()
-        for _ in 0..<16 {
-            tried.append("向上查找: \(dir.path)")
-            if looksLikeRepo(dir) { return (dir, "可执行文件向上查找", tried) }
-            let parent = dir.deletingLastPathComponent()
-            if parent.path == dir.path { break }
-            dir = parent
-        }
-        return (nil, "未定位", tried)
-    }
+    var serverCommand: String { "\"\(node.path)\" \"\(serverEntry.path)\"" }
+    var workerCommand: String { "\"\(node.path)\" \"\(cliEntry.path)\" run" }
 }
 
-// MARK: - node 定位（GUI 由 LaunchServices 启动时 PATH 很稀薄，得自己找）
+enum KernelLocator {
+    /// 内核跑起来必需的文件；少一个就说明 app 没打全。
+    static let requiredFiles = [
+        "src/server/index.mjs",
+        "src/cli.mjs",
+        "src/core/workspace.mjs",
+        "web/index.html",
+        "package.json",
+    ]
 
-enum NodeLocator {
-    static func find() -> String? {
+    /// 顺序：WB_KERNEL（开发期指到仓库）→ Bundle.main.resourcePath/kernel（打包后的唯一形态）。
+    static func resolve() -> (paths: KernelPaths?, error: String, tried: [String]) {
         let fm = FileManager.default
-        if let p = envValue("WB_NODE"), fm.isExecutableFile(atPath: p) { return p }
+        var roots: [(URL, String)] = []
+        if let p = envValue(ShellConst.kernelEnvKey) {
+            roots.append((expandPath(p), ShellConst.kernelEnvKey))
+        }
+        if let res = Bundle.main.resourcePath {
+            roots.append((URL(fileURLWithPath: res, isDirectory: true).appendingPathComponent("kernel", isDirectory: true),
+                          "Bundle Resources/kernel"))
+        }
 
-        var candidates: [String] = [
-            "/opt/homebrew/bin/node",
-            "/opt/homebrew/opt/node@22/bin/node",
-            "/opt/homebrew/opt/node/bin/node",
-            "/usr/local/bin/node",
-            "/usr/bin/node",
-            "/opt/local/bin/node",
-        ]
-        if let path = ProcessInfo.processInfo.environment["PATH"] {
-            for dir in path.split(separator: ":") where !dir.isEmpty {
-                candidates.append(String(dir) + "/node")
+        var tried: [String] = []
+        for (root, source) in roots {
+            tried.append("\(source) = \(root.path)")
+            guard fm.fileExists(atPath: root.path) else { continue }
+            let missing = requiredFiles.filter { !fm.fileExists(atPath: root.appendingPathComponent($0).path) }
+            guard missing.isEmpty else {
+                tried.append("  缺少文件: \(missing.joined(separator: ", "))")
+                continue
             }
+            let nodeURL: URL
+            if let n = envValue("WB_NODE") {
+                nodeURL = expandPath(n)
+            } else {
+                nodeURL = root.appendingPathComponent("node")
+            }
+            guard fm.isExecutableFile(atPath: nodeURL.path) else {
+                tried.append("  node 不可执行: \(nodeURL.path)")
+                continue
+            }
+            let paths = KernelPaths(
+                root: root,
+                node: nodeURL,
+                serverEntry: root.appendingPathComponent("src/server/index.mjs"),
+                cliEntry: root.appendingPathComponent("src/cli.mjs"),
+                source: source
+            )
+            return (paths, "", tried)
         }
-        for c in candidates where fm.isExecutableFile(atPath: c) { return c }
 
-        // nvm / volta / asdf / 本地安装
-        let home = fm.homeDirectoryForCurrentUser
-        let nvmRoot = home.appendingPathComponent(".nvm/versions/node", isDirectory: true)
-        if let versions = try? fm.contentsOfDirectory(atPath: nvmRoot.path) {
-            for v in versions.sorted(by: >) {
-                let candidate = nvmRoot.appendingPathComponent(v).appendingPathComponent("bin/node").path
-                if fm.isExecutableFile(atPath: candidate) { return candidate }
-            }
-        }
-        for rel in [".volta/bin/node", ".asdf/shims/node", ".local/bin/node", "bin/node"] {
-            let candidate = home.appendingPathComponent(rel).path
-            if fm.isExecutableFile(atPath: candidate) { return candidate }
-        }
-        return nil
+        return (nil,
+                "找不到随 app 打包的内核（需要 \(requiredFiles.joined(separator: ", "))）。"
+                    + "请用 bash apps/macshell/build.sh 重新构建；开发期也可用 \(ShellConst.kernelEnvKey)=/path/to/kernel 指定。",
+                tried)
     }
 }
 
-// MARK: - 内核
+// MARK: - 工作区定位
+
+enum WorkspaceLocator {
+    static func defaultWorkspace() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(ShellConst.defaultWorkspaceName, isDirectory: true)
+    }
+
+    static func isDirectory(_ u: URL) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    /// 顺序：WB_WORKSPACE → UserDefaults "workspace" → ~/Workbench。
+    /// 目标是"目录不存在"时（首次启动、或保存的目录被删了）弹原生面板让用户选；取消则退回 ~/Workbench。
+    /// interactive=false（无头自检 / 截图）时绝不弹面板，免得自动化卡在模态框上。
+    static func resolve(interactive: Bool) -> (url: URL, source: String, prompted: Bool) {
+        if let p = envValue("WB_WORKSPACE") {
+            return (expandPath(p), "WB_WORKSPACE", false)
+        }
+
+        let defaults = UserDefaults.standard
+        if let saved = defaults.string(forKey: ShellConst.workspaceDefaultsKey),
+           !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let u = expandPath(saved)
+            if isDirectory(u) { return (u, "UserDefaults workspace", false) }
+            if interactive, let picked = prompt(initial: u) {
+                return (picked, "NSOpenPanel（保存的工作区不存在，已重选）", true)
+            }
+            return (defaultWorkspace(), "fallback（保存的工作区不存在）", false)
+        }
+
+        let fallback = defaultWorkspace()
+        if isDirectory(fallback) { return (fallback, "默认 ~/\(ShellConst.defaultWorkspaceName)", false) }
+        if interactive, let picked = prompt(initial: fallback) {
+            return (picked, "NSOpenPanel", true)
+        }
+        return (fallback, "默认 ~/\(ShellConst.defaultWorkspaceName)（未选择）", false)
+    }
+
+    /// 首次启动：NSAlert 说明 + NSOpenPanel 选目录（可新建）。返回 nil = 用户取消。
+    static func prompt(initial: URL) -> URL? {
+        let alert = NSAlert()
+        alert.messageText = "选择工作区目录"
+        alert.informativeText = """
+        工作台把账本、worktree 和起始仓库写在「工作区」里；内核代码在 app 内部，两者分开。
+        默认是 ~/\(ShellConst.defaultWorkspaceName)（不存在会自动创建），也可以选一个已有目录，或在这里新建。
+
+        当前：\(initial.path)
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "选择目录…")
+        alert.addButton(withTitle: "用 ~/\(ShellConst.defaultWorkspaceName)")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "选择工作区"
+        panel.message = "工作台会在这里创建 data/、worktrees/ 和 demo/ 起始仓库"
+        panel.directoryURL = isDirectory(initial) ? initial : FileManager.default.homeDirectoryForCurrentUser
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+
+        let picked = url.standardizedFileURL
+        UserDefaults.standard.set(picked.path, forKey: ShellConst.workspaceDefaultsKey)
+        return picked
+    }
+}
+
+// MARK: - 工作区初始化（<kernel>/node <kernel>/src/cli.mjs workspace --dir <ws>）
+
+struct WorkspaceInfo {
+    let root: String
+    let db: String
+    let starterRepo: String
+    let summary: String
+}
+
+enum WorkspaceError: LocalizedError {
+    case failed(exit: Int32, output: String, command: String)
+    case badOutput(String, command: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .failed(let code, let output, let command):
+            let tail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "工作区初始化失败（exit \(code)）：\(command)\n\(tail.isEmpty ? "(没有输出)" : tail)"
+        case .badOutput(let output, let command):
+            let tail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "工作区初始化没有返回 JSON：\(command)\n\(tail.isEmpty ? "(没有输出)" : tail)"
+        }
+    }
+}
+
+enum WorkspaceProvisioner {
+    /// 幂等：建 data/ worktrees/ .oc/ 和 demo/ 起始仓库（已有就只补缺，绝不覆盖账本）。
+    /// 用打包的 node 跑打包的 cli，所以不再依赖本机 PATH 里的 node；npm 缺失时护栏会退回 node --test。
+    static func ensure(paths: KernelPaths, workspace: URL) throws -> WorkspaceInfo {
+        let command = "\"\(paths.node.path)\" \"\(paths.cliEntry.path)\" workspace --dir \"\(workspace.path)\""
+        let p = Process()
+        p.executableURL = paths.node
+        p.arguments = [paths.cliEntry.path, "workspace", "--dir", workspace.path]
+        p.currentDirectoryURL = paths.root
+        p.environment = childEnvironment(paths: paths, workspace: workspace, extra: [:])
+
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        do {
+            try p.run()
+        } catch {
+            throw WorkspaceError.failed(exit: -1, output: String(describing: error), command: command)
+        }
+        // 先读到 EOF 再等退出：输出很小，不会写满管道。
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let raw = String(decoding: data, as: UTF8.self)
+
+        guard p.terminationStatus == 0 else {
+            throw WorkspaceError.failed(exit: p.terminationStatus, output: raw, command: command)
+        }
+        guard let line = raw.split(separator: "\n").map(String.init).last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("{") }),
+              let jsonData = line.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any] else {
+            throw WorkspaceError.badOutput(raw, command: command)
+        }
+
+        let root = (obj["root"] as? String) ?? workspace.path
+        let db = (obj["db"] as? String) ?? (root as NSString).appendingPathComponent("data/ledger.db")
+        let starter = (obj["starterRepo"] as? String) ?? (root as NSString).appendingPathComponent("demo")
+
+        var summary = "root=\(root) db=\(db) starter=\(starter)"
+        if let created = obj["created"] as? [String], !created.isEmpty {
+            summary += " created=[\(created.joined(separator: ","))]"
+        }
+        if let starterCreated = obj["starterCreated"] as? Bool {
+            summary += " starterCreated=\(starterCreated)"
+        }
+        if let err = obj["starterError"] as? String {
+            summary += " starterError=\(err)"
+        }
+        return WorkspaceInfo(root: root, db: db, starterRepo: starter, summary: summary)
+    }
+
+    /// 两个子进程共用：WB_ROOT/WB_CODE/WB_DB 固定注入，其余环境（WB_ENGINE、WB_MOCK_SCENARIO…）原样继承。
+    static func childEnvironment(paths: KernelPaths, workspace: URL, extra: [String: String]) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["WB_ROOT"] = workspace.path
+        env["WB_CODE"] = paths.root.path
+        env["WB_DB"] = workspace.appendingPathComponent("data/ledger.db").path
+
+        // 打包的 node 在 kernel/ 里：放进 PATH，护栏退回的 node --test 才能直接找到它。
+        var parts = [paths.root.path, paths.node.deletingLastPathComponent().path]
+        if let existing = env["PATH"], !existing.isEmpty {
+            parts.append(existing)
+        } else {
+            parts.append("/usr/bin:/bin:/usr/sbin:/sbin")
+        }
+        env["PATH"] = parts.joined(separator: ":")
+        for (k, v) in extra { env[k] = v }
+        return env
+    }
+}
+
+// MARK: - 日志（按子进程加前缀，行级切分）
+
+final class PrefixedLogWriter {
+    private let prefix: String
+    private let sink: (String) -> Void
+    private var buffer = Data()
+    private let lock = NSLock()
+
+    init(prefix: String, sink: @escaping (String) -> Void) {
+        self.prefix = prefix
+        self.sink = sink
+    }
+
+    func consume(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        buffer.append(data)
+        var lines: [String] = []
+        while let idx = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+            let line = buffer[buffer.startIndex..<idx]
+            lines.append(String(decoding: line, as: UTF8.self))
+            buffer.removeSubrange(buffer.startIndex...idx)
+        }
+        lock.unlock()
+        for line in lines { sink(prefix + " " + line) }
+    }
+
+    /// 进程退出时把没换行的最后半行也写出去。
+    func flush() {
+        lock.lock()
+        let rest = buffer
+        buffer.removeAll()
+        lock.unlock()
+        guard !rest.isEmpty else { return }
+        sink(prefix + " " + String(decoding: rest, as: UTF8.self))
+    }
+}
+
+// MARK: - 探测
 
 enum KernelError: LocalizedError {
-    case nodeNotFound
     case logNotWritable(String)
     case spawnFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case .nodeNotFound:
-            return "找不到 node 可执行文件（试过 PATH、/opt/homebrew/bin、nvm、volta 等）。可用 WB_NODE=/path/to/node 指定。"
         case .logNotWritable(let p):
             return "日志文件不可写：\(p)"
         case .spawnFailed(let detail):
-            return "node 子进程启动失败：\(detail)"
+            return "子进程启动失败：\(detail)"
         }
     }
 }
@@ -164,6 +372,20 @@ enum ProbeResult {
             return "端口没有响应：\(detail)"
         }
     }
+}
+
+struct WorkspaceSnapshot {
+    let root: String?
+    let code: String?
+    let engine: String?
+    let starterRepo: String?
+}
+
+struct SyncHTTPResult {
+    let status: Int?
+    let data: Data?
+    let error: Error?
+    let timedOut: Bool
 }
 
 enum ProbeTransport {
@@ -192,6 +414,15 @@ enum ProbeTransport {
         return .occupied(status: status, detail: "响应不是工作台内核的 JSON（开头：\(head)）")
     }
 
+    static func snapshot(from data: Data?) -> WorkspaceSnapshot? {
+        guard let data,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return WorkspaceSnapshot(root: obj["root"] as? String,
+                                 code: obj["code"] as? String,
+                                 engine: obj["engine"] as? String,
+                                 starterRepo: obj["starterRepo"] as? String)
+    }
+
     static func request(url: URL, token: String?, timeout: TimeInterval) -> URLRequest {
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         if let token, !token.isEmpty {
@@ -200,8 +431,8 @@ enum ProbeTransport {
         return req
     }
 
-    /// 同步探测：给 WB_SHELL_SMOKE 用（旋转 run loop，等 dataTask 回调）。
-    static func probeSync(url: URL, token: String?, timeout: TimeInterval) -> ProbeResult {
+    /// 同步 GET：给 WB_SHELL_SMOKE 用（旋转 run loop，等 dataTask 回调）。
+    static func getSync(url: URL, token: String?, timeout: TimeInterval) -> SyncHTTPResult {
         let lock = NSLock()
         var status: Int?
         var data: Data?
@@ -241,45 +472,80 @@ enum ProbeTransport {
         if !finished {
             task.cancel()
             session.invalidateAndCancel()
-            return .down(detail: "探测超时（\(Int(timeout)) 秒）")
+            return SyncHTTPResult(status: nil, data: nil, error: nil, timedOut: true)
         }
         session.finishTasksAndInvalidate()
-        return classify(status: s, data: d, error: e)
+        return SyncHTTPResult(status: s, data: d, error: e, timedOut: false)
     }
 
-    /// 异步探测：给 GUI 用，回调固定在主线程。
-    static func probeAsync(url: URL, token: String?, timeout: TimeInterval, completion: @escaping (ProbeResult) -> Void) {
+    static func probeSync(url: URL, token: String?, timeout: TimeInterval) -> ProbeResult {
+        let r = getSync(url: url, token: token, timeout: timeout)
+        if r.timedOut { return .down(detail: "探测超时（\(Int(timeout)) 秒）") }
+        return classify(status: r.status, data: r.data, error: r.error)
+    }
+
+    /// 异步 GET：给 GUI 用，回调固定在主线程。
+    static func getAsync(url: URL, token: String?, timeout: TimeInterval,
+                         completion: @escaping (SyncHTTPResult) -> Void) {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = timeout
         cfg.waitsForConnectivity = false
         let session = URLSession(configuration: cfg)
         let task = session.dataTask(with: request(url: url, token: token, timeout: timeout)) { d, resp, e in
-            let result = classify(status: (resp as? HTTPURLResponse)?.statusCode, data: d, error: e)
+            let r = SyncHTTPResult(status: (resp as? HTTPURLResponse)?.statusCode, data: d, error: e, timedOut: false)
             session.finishTasksAndInvalidate()
-            DispatchQueue.main.async { completion(result) }
+            DispatchQueue.main.async { completion(r) }
         }
         task.resume()
+    }
+
+    static func probeAsync(url: URL, token: String?, timeout: TimeInterval,
+                           completion: @escaping (ProbeResult) -> Void) {
+        getAsync(url: url, token: token, timeout: timeout) { r in
+            completion(classify(status: r.status, data: r.data, error: r.error))
+        }
+    }
+}
+
+// MARK: - 子进程
+
+final class ShellChild {
+    let name: String          // "server" | "worker"
+    let process: Process
+    let pipe: Pipe
+    let writer: PrefixedLogWriter
+
+    init(name: String, process: Process, pipe: Pipe, writer: PrefixedLogWriter) {
+        self.name = name
+        self.process = process
+        self.pipe = pipe
+        self.writer = writer
     }
 }
 
 final class Kernel {
-    let repoRoot: URL
+    let paths: KernelPaths
+    let workspace: URL
+    let workspaceSource: String
+    let info: WorkspaceInfo
     let port: Int
     let token: String?
     /// 实际使用的日志路径；首选目标不可写时会降级到临时目录。
     private(set) var logURL: URL
 
-    private(set) var child: Process?
-    private(set) var ownsChild = false
-    var onUnexpectedExit: ((Int32) -> Void)?
+    private(set) var children: [ShellChild] = []
+    var onUnexpectedExit: ((String, Int32) -> Void)?
 
-    private var pipe: Pipe?
     private var logHandle: FileHandle?
     private var stopping = false
     private let logLock = NSLock()
 
-    init(repoRoot: URL, port: Int, token: String?, logURL: URL) {
-        self.repoRoot = repoRoot
+    init(paths: KernelPaths, workspace: URL, workspaceSource: String, info: WorkspaceInfo,
+         port: Int, token: String?, logURL: URL) {
+        self.paths = paths
+        self.workspace = workspace
+        self.workspaceSource = workspaceSource
+        self.info = info
         self.port = port
         self.token = token
         self.logURL = logURL
@@ -320,8 +586,8 @@ final class Kernel {
     }
 
     var baseURL: URL { URL(string: "http://127.0.0.1:\(port)/")! }
-
     var apiTasksURL: URL { URL(string: "http://127.0.0.1:\(port)/api/tasks")! }
+    var apiWorkspaceURL: URL { URL(string: "http://127.0.0.1:\(port)/api/workspace")! }
 
     /// 页面地址；设了 WB_TOKEN 时把 token 带进 query，和 web/app.js 的约定一致。
     var pageURL: URL {
@@ -332,9 +598,9 @@ final class Kernel {
         return comps.url!
     }
 
-    var dataDir: URL { repoRoot.appendingPathComponent("data", isDirectory: true) }
-
-    var dbPath: String { dataDir.appendingPathComponent("ledger.db").path }
+    var dataDir: URL { workspace.appendingPathComponent("data", isDirectory: true) }
+    var serverChild: ShellChild? { children.first { $0.name == "server" } }
+    var workerChild: ShellChild? { children.first { $0.name == "worker" } }
 
     // MARK: 日志
 
@@ -354,7 +620,7 @@ final class Kernel {
         guard let h = try? FileHandle(forReadingFrom: logURL) else { return "(日志文件还没生成：\(logURL.path))" }
         defer { try? h.close() }
         let size = (try? h.seekToEnd()) ?? 0
-        let readSize = min(size, UInt64(16 * 1024))
+        let readSize = min(size, UInt64(32 * 1024))
         if readSize == 0 { return "(日志为空：\(logURL.path))" }
         try? h.seek(toOffset: size - readSize)
         let data = (try? h.read(upToCount: Int(readSize))) ?? Data()
@@ -370,117 +636,157 @@ final class Kernel {
     }
 
     func probeAsync(_ completion: @escaping (ProbeResult) -> Void) {
-        ProbeTransport.probeAsync(url: apiTasksURL, token: token, timeout: ShellConst.probeTimeout, completion: completion)
+        ProbeTransport.probeAsync(url: apiTasksURL, token: token, timeout: ShellConst.probeTimeout,
+                                  completion: completion)
     }
 
-    // MARK: 起内核
+    func workspaceSnapshotSync() -> WorkspaceSnapshot? {
+        let r = ProbeTransport.getSync(url: apiWorkspaceURL, token: token, timeout: ShellConst.probeTimeout)
+        guard r.status == 200 else { return nil }
+        return ProbeTransport.snapshot(from: r.data)
+    }
 
+    func workspaceSnapshotAsync(_ completion: @escaping (WorkspaceSnapshot?) -> Void) {
+        ProbeTransport.getAsync(url: apiWorkspaceURL, token: token, timeout: ShellConst.probeTimeout) { r in
+            completion(r.status == 200 ? ProbeTransport.snapshot(from: r.data) : nil)
+        }
+    }
+
+    /// 就绪后把内核自报的 workspace/code/engine 记进日志（attach 到别人起的内核时尤其有用）。
+    func logRuntimeInfo(attached: Bool, tasks: Int) {
+        workspaceSnapshotAsync { [weak self] snap in
+            guard let self else { return }
+            self.writeLog("==== \(isoNow()) ready mode=\(attached ? "attach" : "spawn") tasks=\(tasks) "
+                + "port=\(self.port) workspace=\(snap?.root ?? self.workspace.path) "
+                + "code=\(snap?.code ?? self.paths.root.path) engine=\(snap?.engine ?? "?") ====")
+        }
+    }
+
+    // MARK: 起子进程
+
+    /// 只在 attach 未命中时调用：server（HTTP + 静态页）+ worker（常驻任务循环）。
     func spawn() throws {
-        if child != nil { return }
-        guard let node = NodeLocator.find() else { throw KernelError.nodeNotFound }
-
+        guard children.isEmpty else { return }
         logHandle = try openLogHandle()
         stopping = false
 
         if logURL.path != Kernel.preferredLogURL().path {
             writeLog("==== 提示：\(Kernel.preferredLogURL().path) 不可写，日志退到 \(logURL.path) ====")
         }
-        writeLog("==== \(isoNow()) shell spawn node=\(node) port=\(port) repo=\(repoRoot.path) ====")
+        writeLog("==== \(isoNow()) shell spawn ====")
+        writeLog("==== workspace: \(info.summary)（来源：\(workspaceSource)） ====")
+        writeLog("==== kernel: \(paths.root.path)（\(paths.source)）node=\(paths.node.path) ====")
+        writeLog("==== server: \(paths.serverCommand) ====")
+        writeLog("==== worker: \(paths.workerCommand) ====")
 
+        let server = try spawnChild(name: "server",
+                                    arguments: [paths.serverEntry.path],
+                                    extra: ["WB_PORT": String(port)])
+        children = [server]
+        gServerPid = server.process.processIdentifier
+
+        do {
+            let worker = try spawnChild(name: "worker",
+                                        arguments: [paths.cliEntry.path, "run"],
+                                        extra: [:])
+            children.append(worker)
+            gWorkerPid = worker.process.processIdentifier
+        } catch {
+            // worker 起不来时别把 server 留成孤儿
+            stopChildren(reason: "worker spawn failed")
+            throw error
+        }
+    }
+
+    private func spawnChild(name: String, arguments: [String], extra: [String: String]) throws -> ShellChild {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: node)
-        p.arguments = ["src/server/index.mjs"]
-        p.currentDirectoryURL = repoRoot
+        p.executableURL = paths.node
+        p.arguments = arguments
+        p.currentDirectoryURL = paths.root
+        p.environment = WorkspaceProvisioner.childEnvironment(paths: paths, workspace: workspace, extra: extra)
 
-        var environment = ProcessInfo.processInfo.environment
-        environment["WB_ROOT"] = repoRoot.path
-        environment["WB_DB"] = dbPath
-        environment["WB_PORT"] = String(port)
-        let nodeDir = (node as NSString).deletingLastPathComponent
-        environment["PATH"] = nodeDir + ":" + (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
-        p.environment = environment
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
 
-        let outPipe = Pipe()
-        p.standardOutput = outPipe
-        p.standardError = outPipe
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] fh in
+        let writer = PrefixedLogWriter(prefix: "[\(name)]") { [weak self] line in
+            self?.writeLog(line)
+        }
+        pipe.fileHandleForReading.readabilityHandler = { fh in
             let data = fh.availableData
             if data.isEmpty { return }
-            self?.writeLogData(data)
+            writer.consume(data)
         }
         p.terminationHandler = { [weak self] proc in
-            let status = proc.terminationStatus
-            DispatchQueue.main.async { self?.childExited(code: status) }
+            let code = proc.terminationStatus
+            DispatchQueue.main.async { self?.childExited(name: name, code: code, writer: writer, pipe: pipe) }
         }
 
         do {
             try p.run()
         } catch {
-            try? logHandle?.close()
-            logHandle = nil
-            throw KernelError.spawnFailed(String(describing: error))
+            pipe.fileHandleForReading.readabilityHandler = nil
+            throw KernelError.spawnFailed("\(name): \(error.localizedDescription)")
         }
-
-        child = p
-        ownsChild = true
-        pipe = outPipe
-        gChildPid = p.processIdentifier
-        writeLog("==== shell child pid=\(p.processIdentifier) ====")
+        writeLog("==== \(name) pid=\(p.processIdentifier) args=\(arguments.joined(separator: " ")) ====")
+        return ShellChild(name: name, process: p, pipe: pipe, writer: writer)
     }
 
-    private func childExited(code: Int32) {
-        writeLog("==== \(isoNow()) shell child exited code=\(code) ====")
-        pipe?.fileHandleForReading.readabilityHandler = nil
-        if let fh = pipe?.fileHandleForReading {
-            let rest = fh.availableData
-            if !rest.isEmpty { writeLogData(rest) }
-        }
-        let wasOwned = ownsChild
+    private func childExited(name: String, code: Int32, writer: PrefixedLogWriter, pipe: Pipe) {
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let rest = pipe.fileHandleForReading.availableData
+        if !rest.isEmpty { writer.consume(rest) }
+        writer.flush()
+        writeLog("==== \(isoNow()) \(name) exited code=\(code) ====")
+        if name == "server" { gServerPid = 0 } else { gWorkerPid = 0 }
+
         let intentional = stopping
-        ownsChild = false
-        child = nil
-        gChildPid = 0
-        if wasOwned && !intentional {
-            onUnexpectedExit?(code)
-        }
-        if intentional {
-            logLock.lock()
-            try? logHandle?.close()
-            logHandle = nil
-            logLock.unlock()
+        children.removeAll { $0.name == name }
+        if intentional { return }
+
+        if name == "server" {
+            onUnexpectedExit?(name, code)
+        } else {
+            writeLog("==== 警告：worker 意外退出（exit=\(code)），任务会停在排队状态；⌘R 可重启 ====")
         }
     }
 
-    /// 只终止自己起的子进程：SIGTERM → 等 3 秒 → SIGKILL。attach 模式下 ownsChild=false，什么都不做。
-    func stopChild(reason: String) {
-        guard let p = child, ownsChild else { return }
+    /// 只终止自己起的子进程：worker 先收、server 后收，每个 SIGTERM → 等 3 秒 → SIGKILL。
+    /// attach 模式下 children 为空，什么都不做。
+    func stopChildren(reason: String) {
+        guard !children.isEmpty else { return }
         stopping = true
-        let pid = p.processIdentifier
-        writeLog("==== \(isoNow()) shell stop child pid=\(pid) reason=\(reason) ====")
-        if p.isRunning { p.terminate() }
-        let deadline = Date().addingTimeInterval(3)
-        while p.isRunning && Date() < deadline {
-            usleep(50_000)
-        }
-        if p.isRunning {
-            kill(pid, SIGKILL)
-            writeLog("==== shell child still alive after 3s, sent SIGKILL ====")
-            let hard = Date().addingTimeInterval(1)
-            while p.isRunning && Date() < hard {
-                usleep(20_000)
+        let snapshot = children
+        for child in snapshot.reversed() {
+            let pid = child.process.processIdentifier
+            writeLog("==== \(isoNow()) shell stop \(child.name) pid=\(pid) reason=\(reason) ====")
+            if child.process.isRunning { child.process.terminate() }
+            let deadline = Date().addingTimeInterval(ShellConst.stopGrace)
+            while child.process.isRunning && Date() < deadline {
+                usleep(50_000)
             }
+            if child.process.isRunning {
+                kill(pid, SIGKILL)
+                writeLog("==== \(child.name) 3 秒后仍在，已 SIGKILL ====")
+                let hard = Date().addingTimeInterval(1.0)
+                while child.process.isRunning && Date() < hard {
+                    usleep(20_000)
+                }
+            }
+            child.pipe.fileHandleForReading.readabilityHandler = nil
+            child.writer.flush()
         }
-        pipe?.fileHandleForReading.readabilityHandler = nil
-        child = nil
-        ownsChild = false
-        gChildPid = 0
+        children = []
+        gServerPid = 0
+        gWorkerPid = 0
+        writeLog("==== \(isoNow()) shell children stopped（\(snapshot.map { $0.name }.joined(separator: ", "))） ====")
+
         logLock.lock()
         try? logHandle?.close()
         logHandle = nil
         logLock.unlock()
     }
 }
-
 
 // MARK: - 静态页面（启动占位 / 失败页）
 
@@ -528,36 +834,41 @@ enum ShellHTML {
         """
     }
 
-    static func placeholder(port: Int, repo: String, logPath: String) -> String {
+    static func placeholder(port: Int, workspace: String, kernel: String, logPath: String) -> String {
         let body = """
         <h1>工作台</h1>
         <p class="spin">正在连接内核…</p>
         <dl>
           <dt>端口</dt><dd>127.0.0.1:\(port)</dd>
-          <dt>仓库</dt><dd>\(esc(repo))</dd>
+          <dt>工作区</dt><dd>\(esc(workspace))</dd>
+          <dt>内核</dt><dd>\(esc(kernel))</dd>
           <dt>内核日志</dt><dd>\(esc(logPath))</dd>
         </dl>
-        <p class="muted">已在跑就直接接管；没在跑就由外壳拉起 node src/server/index.mjs，最多等 15 秒。</p>
+        <p class="muted">已在跑就直接接管；没在跑就由外壳拉起 server 与 worker，最多等 15 秒。</p>
         """
         return wrap("工作台 · 启动中", body)
     }
 
-    static func errorPage(reason: String, port: Int, repo: String, logPath: String, tail: String) -> String {
+    static func errorPage(reason: String, port: Int, workspace: String, kernel: String,
+                          logPath: String, tail: String) -> String {
         let safeTail = esc(tail.isEmpty ? "(日志为空)" : tail)
         let body = """
         <h1>内核没有起来</h1>
         <p class="reason">\(esc(reason))</p>
         <dl>
           <dt>端口</dt><dd>127.0.0.1:\(port)</dd>
-          <dt>仓库</dt><dd>\(esc(repo))</dd>
+          <dt>工作区</dt><dd>\(esc(workspace))</dd>
+          <dt>内核</dt><dd>\(esc(kernel))</dd>
           <dt>内核日志</dt><dd>\(esc(logPath))</dd>
         </dl>
         <h2>怎么排查</h2>
         <ul>
           <li>看日志：<code>tail -n 80 "\(esc(logPath))"</code></li>
-          <li>手动试一次：<code>WB_ROOT="\(esc(repo))" WB_DB="\(esc(repo))/data/ledger.db" node src/server/index.mjs</code></li>
+          <li>手动起 server：<code>WB_ROOT="\(esc(workspace))" WB_CODE="\(esc(kernel))" "\(esc(kernel))/node" "\(esc(kernel))/src/server/index.mjs"</code></li>
+          <li>手动起 worker：<code>WB_ROOT="\(esc(workspace))" WB_CODE="\(esc(kernel))" "\(esc(kernel))/node" "\(esc(kernel))/src/cli.mjs" run</code></li>
+          <li>只起 server 任务会永远排队 —— 两个进程缺一不可</li>
           <li>端口被别的服务占着就换一个：重启外壳前设 <code>WB_PORT=7401</code></li>
-          <li>按 <kbd>⌘R</kbd> 重试，<kbd>⌘O</kbd> 打开数据目录，<kbd>⌘Q</kbd> 退出</li>
+          <li>按 <kbd>⌘R</kbd> 重试，<kbd>⌘O</kbd> 打开工作区数据目录，<kbd>⌘Q</kbd> 退出</li>
         </ul>
         <h2>日志末尾</h2>
         <pre class="log">\(safeTail)</pre>
@@ -587,17 +898,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         installSignalHandlers()
 
-        let located = RepoLocator.resolve()
-        guard let root = located.root else {
-            showRepoAlert(located)
-            return
+        // 1) 内核：只在 app 包里找（WB_KERNEL 是开发期后门）
+        let located = KernelLocator.resolve()
+        guard let paths = located.paths else {
+            showFatalAlert(title: "找不到 app 内置内核",
+                           message: located.error + "\n\n已尝试：\n" + located.tried.joined(separator: "\n"))
+        }
+
+        // 2) 工作区：WB_WORKSPACE → UserDefaults → ~/Workbench；不存在时弹面板选
+        let interactive = envValue("WB_SHELL_SMOKE") != "1" && envValue("WB_SHELL_SHOT") == nil
+        let ws = WorkspaceLocator.resolve(interactive: interactive)
+
+        // 3) 启动前把目录结构与起始仓库补齐（幂等）
+        let info: WorkspaceInfo
+        do {
+            info = try WorkspaceProvisioner.ensure(paths: paths, workspace: ws.url)
+        } catch {
+            showFatalAlert(title: "工作区初始化失败",
+                           message: error.localizedDescription + "\n\n工作区：\(ws.url.path)")
         }
 
         let port = Int(envValue("WB_PORT") ?? "") ?? ShellConst.defaultPort
-        let k = Kernel(repoRoot: root, port: port, token: envValue("WB_TOKEN"), logURL: Kernel.logFileURL())
-        k.onUnexpectedExit = { [weak self] code in
+        let k = Kernel(paths: paths, workspace: ws.url, workspaceSource: ws.source, info: info,
+                       port: port, token: envValue("WB_TOKEN"), logURL: Kernel.logFileURL())
+        k.onUnexpectedExit = { [weak self] name, code in
             guard let self, self.loaded else { return }
-            self.fail(reason: "内核进程意外退出（exit=\(code)）。可以按 ⌘R 重新拉起。")
+            self.fail(reason: "\(name) 进程意外退出（exit=\(code)）。可以按 ⌘R 重新拉起。")
         }
         kernel = k
 
@@ -613,7 +939,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         bootTimer?.invalidate()
         bootTimer = nil
-        kernel?.stopChild(reason: "app quit")
+        kernel?.stopChildren(reason: "app quit")
     }
 
     // MARK: 窗口 / 菜单
@@ -684,7 +1010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let reload = NSMenuItem(title: "刷新页面", action: #selector(reloadPage(_:)), keyEquivalent: "r")
         reload.target = self
         viewMenu.addItem(reload)
-        let openData = NSMenuItem(title: "打开数据目录", action: #selector(openDataDir(_:)), keyEquivalent: "o")
+        let openData = NSMenuItem(title: "打开工作区数据目录", action: #selector(openDataDir(_:)), keyEquivalent: "o")
         openData.target = self
         viewMenu.addItem(openData)
         viewItem.submenu = viewMenu
@@ -708,7 +1034,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         // 启动失败后再按 ⌘R：收掉残留子进程，重新走一遍 attach / spawn。
         bootTimer?.invalidate()
         bootTimer = nil
-        kernel?.stopChild(reason: "manual retry")
+        kernel?.stopChildren(reason: "manual retry")
         startBoot()
     }
 
@@ -733,6 +1059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             guard let self, let kernel = self.kernel else { return }
             switch result {
             case .kernel(let n):
+                // 已有内核在跑：纯 attach，不再起 worker（避免两个 worker 抢同一个任务）
                 self.ready(tasks: n, attached: true)
             case .occupied:
                 self.fail(reason: "端口 \(kernel.port) 已被其他服务占用，但它不是工作台内核（\(result.summary)）。"
@@ -764,8 +1091,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             fail(reason: "内核 \(Int(ShellConst.bootDeadline)) 秒内没有就绪（端口 \(kernel.port) 一直没有响应）。")
             return
         }
-        if let p = kernel.child, !p.isRunning {
-            fail(reason: "内核子进程已退出，端口 \(kernel.port) 没起来。")
+        if let server = kernel.serverChild, !server.process.isRunning {
+            fail(reason: "server 子进程已退出（exit=\(server.process.terminationStatus)），端口 \(kernel.port) 没起来。")
             return
         }
         if probing { return }
@@ -787,8 +1114,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         guard let kernel else { return }
         window.title = "工作台 · Workbench（:\(kernel.port)）"
         webView.load(URLRequest(url: kernel.pageURL))
-        NSLog("workbench shell ready: tasks=%d mode=%@ port=%d",
-              tasks, attached ? "attach" : "spawn", kernel.port)
+        kernel.logRuntimeInfo(attached: attached, tasks: tasks)
+        let mode = attached ? "attach" : "spawn"
+        print("ready mode=\(mode) port=\(kernel.port) workspace=\(kernel.workspace.path) "
+            + "code=\(kernel.paths.root.path) tasks=\(tasks) log=\(kernel.logURL.path)")
+        NSLog("workbench shell ready: tasks=%d mode=%@ port=%d workspace=%@ code=%@",
+              tasks, mode, kernel.port, kernel.workspace.path, kernel.paths.root.path)
     }
 
     private func fail(reason: String) {
@@ -797,10 +1128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         probing = false
         loaded = false
         guard let kernel else { return }
-        kernel.stopChild(reason: "boot failed")
+        kernel.stopChildren(reason: "boot failed")
         let html = ShellHTML.errorPage(reason: reason,
                                        port: kernel.port,
-                                       repo: kernel.repoRoot.path,
+                                       workspace: kernel.workspace.path,
+                                       kernel: kernel.paths.root.path,
                                        logPath: kernel.logURL.path,
                                        tail: kernel.logTail(maxLines: 30))
         webView.loadHTMLString(html, baseURL: nil)
@@ -811,25 +1143,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private func showPlaceholder() {
         guard let kernel else { return }
         webView.loadHTMLString(ShellHTML.placeholder(port: kernel.port,
-                                                     repo: kernel.repoRoot.path,
+                                                     workspace: kernel.workspace.path,
+                                                     kernel: kernel.paths.root.path,
                                                      logPath: kernel.logURL.path),
                                baseURL: nil)
     }
 
-    private func showRepoAlert(_ located: (root: URL?, source: String, tried: [String])) {
+    private func showFatalAlert(title: String, message: String) -> Never {
         let alert = NSAlert()
-        alert.messageText = "找不到工作台仓库"
-        alert.informativeText = """
-        外壳需要仓库根目录（含 src/server/index.mjs 的目录）才能起内核。
-
-        三种配置方式，任选其一：
-        1) 启动时设环境变量 WB_REPO=/path/to/Deepseek
-        2) 在 Info.plist 里写 WBRepoRoot（build.sh 会自动写入仓库根）
-        3) 把 .app 放在仓库目录下（例如 dist/），外壳会从可执行文件向上查找
-
-        已尝试：
-        \(located.tried.suffix(8).joined(separator: "\n"))
-        """
+        alert.messageText = title
+        alert.informativeText = message
         alert.alertStyle = .critical
         alert.addButton(withTitle: "退出")
         alert.runModal()
@@ -868,7 +1191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         webView.takeSnapshot(with: cfg) { [weak self] image, error in
             guard let self else { return }
             let finish: (Int32) -> Never = { code in
-                self.kernel?.stopChild(reason: "screenshot done")
+                self.kernel?.stopChildren(reason: "screenshot done")
                 exit(code)
             }
             if let error {
@@ -908,21 +1231,33 @@ enum SmokeCheck {
     static func run() -> Never {
         installSignalHandlers()
 
-        let located = RepoLocator.resolve()
-        guard let root = located.root else {
-            fail("仓库未定位（找不到含 src/server/index.mjs 的目录）。已尝试："
-                + located.tried.joined(separator: " | ")
-                + "；用 WB_REPO=/path/to/repo 指定。",
-                logPath: Kernel.logFileURL().path)
+        let located = KernelLocator.resolve()
+        guard let paths = located.paths else {
+            fail("找不到 app 内置内核：\(located.error)\n已尝试：\(located.tried.joined(separator: " | "))",
+                 logPath: Kernel.logFileURL().path)
+        }
+
+        // 自检绝不弹面板：给了 WB_WORKSPACE 就用，没给就落到 ~/Workbench
+        let ws = WorkspaceLocator.resolve(interactive: false)
+        let info: WorkspaceInfo
+        do {
+            info = try WorkspaceProvisioner.ensure(paths: paths, workspace: ws.url)
+        } catch {
+            fail("工作区初始化失败：\(error.localizedDescription)", logPath: Kernel.logFileURL().path)
         }
 
         let port = Int(envValue("WB_PORT") ?? "") ?? ShellConst.defaultPort
-        let kernel = Kernel(repoRoot: root, port: port, token: envValue("WB_TOKEN"), logURL: Kernel.logFileURL())
+        let kernel = Kernel(paths: paths, workspace: ws.url, workspaceSource: ws.source, info: info,
+                            port: port, token: envValue("WB_TOKEN"), logURL: Kernel.logFileURL())
+        print("workspace=\(info.root) workspaceSource=\(ws.source) starterRepo=\(info.starterRepo)")
 
         // 1) 已经在跑 → attach，不碰别人的进程
         switch kernel.probeSync() {
         case .kernel(let n):
-            print("kernel=ok tasks=\(n) mode=attach port=\(port)")
+            let snap = kernel.workspaceSnapshotSync()
+            print("kernel=ok tasks=\(n) mode=attach port=\(port) "
+                + "workspace=\(snap?.root ?? info.root) code=\(snap?.code ?? paths.root.path) "
+                + "engine=\(snap?.engine ?? "?")")
             exit(0)
         case .occupied(let status, let detail):
             fail("端口 \(port) 已被其他服务占用，但它不是工作台内核（GET /api/tasks → HTTP \(status)：\(detail)）。"
@@ -932,7 +1267,7 @@ enum SmokeCheck {
             break
         }
 
-        // 2) 没在跑 → 自己起一个，每 150ms 探一次，最多 15 秒
+        // 2) 没在跑 → 自己起 server + worker，每 150ms 探一次，最多 15 秒
         do {
             try kernel.spawn()
         } catch {
@@ -944,21 +1279,26 @@ enum SmokeCheck {
             usleep(useconds_t(ShellConst.probeInterval * 1_000_000))
 
             if case .kernel(let n) = kernel.probeSync() {
-                print("kernel=ok tasks=\(n) mode=spawn port=\(port) pid=\(kernel.child?.processIdentifier ?? -1)")
-                kernel.stopChild(reason: "smoke done")
+                let snap = kernel.workspaceSnapshotSync()
+                print("kernel=ok tasks=\(n) mode=spawn port=\(port) "
+                    + "workspace=\(snap?.root ?? info.root) code=\(snap?.code ?? paths.root.path) "
+                    + "engine=\(snap?.engine ?? "?") "
+                    + "server=\(kernel.serverChild?.process.processIdentifier ?? -1) "
+                    + "worker=\(kernel.workerChild?.process.processIdentifier ?? -1) log=\(kernel.logURL.path)")
+                kernel.stopChildren(reason: "smoke done")
                 exit(0)
             }
 
-            if let p = kernel.child, !p.isRunning {
-                let status = p.terminationStatus
-                kernel.stopChild(reason: "child exited early")
-                fail("内核子进程提前退出（exit=\(status)），端口 \(port) 没就绪。最近日志：\n"
+            if let server = kernel.serverChild, !server.process.isRunning {
+                let status = server.process.terminationStatus
+                kernel.stopChildren(reason: "server exited early")
+                fail("server 子进程提前退出（exit=\(status)），端口 \(port) 没就绪。最近日志：\n"
                     + kernel.logTail(maxLines: 20),
                     logPath: kernel.logURL.path)
             }
         }
 
-        kernel.stopChild(reason: "boot timeout")
+        kernel.stopChildren(reason: "boot timeout")
         fail("内核 \(Int(ShellConst.bootDeadline)) 秒内没有就绪（端口 \(port)）。最近日志：\n"
             + kernel.logTail(maxLines: 20),
             logPath: kernel.logURL.path)

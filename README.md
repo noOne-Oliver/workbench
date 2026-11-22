@@ -139,15 +139,22 @@ divzero    awaiting_human      1   477178   311 pass
 
 ## 桌面外壳（方案 2）
 
-`apps/macshell/` 用 Swift + AppKit + WKWebView 把上面那个三栏收件箱装进一个原生窗口，**界面逻辑一行没改**。
-外壳只做两件事：把 `http://127.0.0.1:7317/` 装进窗口，以及管内核进程的生命周期——已经在跑就直接 attach（不抢端口、不动别人的进程），没在跑就 `node src/server/index.mjs` 起一个，退出时只收自己起的那个。默认 1200×800，⌘R 刷新、⌘O 打开数据目录、⌘Q 退出。
+`apps/macshell/` 用 Swift + AppKit + WKWebView 把上面那个三栏收件箱装进一个原生窗口，**界面逻辑一行没改**；
+并且**把内核一起打包进 app**：`Contents/Resources/kernel/` 里是打包用的 node、内核（`src/`）和前端（`web/`）。
+所以 app 拷到 `/tmp`、拷到 `/Applications` 都能直接跑 —— 不需要仓库，也不需要本机装 node。
+
+外壳起**两个**子进程：`server`（HTTP + 静态页面）和 `worker`（常驻任务循环）。
+只起 server 任务会永远排队，所以两个都起；已经在跑就**纯 attach**（不动别人的进程，也不再起 worker）。默认 1200×800，⌘R 刷新、⌘O 打开工作区数据目录、⌘Q 退出。
+
+数据在**工作区**里（账本、worktree、起始仓库 `demo/`），和 app 分开：`WB_WORKSPACE` → `UserDefaults` 的 `workspace` → `~/Workbench`；目录不存在时弹原生面板让你选（可新建），取消就退回 `~/Workbench`。
 
 ```bash
-bash apps/macshell/build.sh              # swiftc 编译 + 组装 + ad-hoc 签名 → dist/Workbench.app
+bash apps/macshell/build.sh              # swiftc 编译 + 内核打包 + ad-hoc 签名 → dist/Workbench.app
 open -a "$PWD/dist/Workbench.app"
 
-# 无头自检：定位仓库 → attach 或起内核 → 请求 /api/tasks → 打印 kernel=ok tasks=<n>
+# 无头自检：定位内核 → 准备工作区 → attach 或起 server+worker → 请求 /api/tasks
 WB_SHELL_SMOKE=1 dist/Workbench.app/Contents/MacOS/Workbench
+# kernel=ok tasks=0 mode=spawn port=7317 workspace=/Users/liujie/Workbench code=.../Resources/kernel engine=mock
 
 # 证据截图：加载页面 → 打印 DOM 断言（卡片数/正文）→ 存 PNG → 退出
 WB_SHELL_SHOT=docs/shell-shot.png dist/Workbench.app/Contents/MacOS/Workbench
@@ -155,9 +162,9 @@ WB_SHELL_SHOT=docs/shell-shot.png dist/Workbench.app/Contents/MacOS/Workbench
 # shot=ok path=/.../docs/shell-shot.png bytes=214438 size=1446x894
 ```
 
-上面这张图就是这条命令在真 app 里抓下来的，不是浏览器截图：**窗口真的把收件箱画出来了**（DOM 断言 3 张卡片、正文含任务标题与预算），像素统计 2827 种颜色、三栏亮区分明。
+上面这张图就是这条命令在真 app 里抓下来的，不是浏览器截图：**窗口真的把收件箱画出来了**（DOM 断言 3 张卡片、正文含任务标题与预算）。
 
-边界：内核没打包进 app、本机得有 node，所以现在是 **launcher 而不是可分发安装包**；ad-hoc 签名只能本机跑（无公证、无 App Sandbox）。详见 [docs/shell.md](docs/shell.md)。
+边界：ad-hoc 签名只能本机跑（无公证、无 App Sandbox）；`kernel/node` 是 homebrew 的动态链接版，换机器要重新 `build.sh`。详见 [docs/shell.md](docs/shell.md)。
 
 ## 重试闭环（护栏 FAIL → 打回 → 重做 → 通过）
 
@@ -204,5 +211,5 @@ web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
 scripts/      demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）
-apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView，方案 2 第一步）
+apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView；内核打包进 app，离仓可运行）
 ```
