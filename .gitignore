@@ -6,3 +6,4 @@ sandbox/
 *.log
 .DS_Store
 dist/
+.demo/

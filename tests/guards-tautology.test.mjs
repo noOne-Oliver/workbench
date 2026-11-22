@@ -154,3 +154,29 @@ test("预算不足时提前拦住，不留半截活", () => {
   assert.equal(reserveShort({ budget_tokens: 1000000, spent_tokens: 800000 }, 0.05), "", "比例调低就放行");
 });
 
+
+test("实现只含运算符时，恒真断言也必须被抓（曾经的假绿漏洞）", () => {
+  const { repo, base } = repoWith({
+    "src/calc.mjs": [
+      "export function calc(a, b, op) {",
+      '  if (op === "+") return a + b;',
+      '  if (op === "-") return a - b;',
+      "  return a * b;",
+      "}",
+      "",
+    ].join("\n"),
+    "test/calc.test.mjs": [
+      'import test from "node:test";',
+      'import assert from "node:assert/strict";',
+      'import { calc } from "../src/calc.mjs";',
+      'test("加", () => { assert.equal(calc(2, 3, "+"), calc(2, 3, "+")); });',
+      'test("减", () => { assert.equal(calc(5, 3, "-"), 2); });',
+    ].join("\n"),
+  });
+  const g = runGuards({ workdir: repo, base });
+  const c = chk(g, "no_tautological_test");
+  assert.equal(c.ok, false, "实现只用运算符时，两边同一表达式仍是恒真断言");
+  assert.match(c.detail, /calc\.test\.mjs:4/, "要指出具体哪一行");
+  assert.match(c.detail, /期望值与实际值/, "要说清是哪类同义反复");
+});
+

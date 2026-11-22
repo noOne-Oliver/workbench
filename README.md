@@ -159,6 +159,35 @@ WB_SHELL_SHOT=docs/shell-shot.png dist/Workbench.app/Contents/MacOS/Workbench
 
 边界：内核没打包进 app、本机得有 node，所以现在是 **launcher 而不是可分发安装包**；ad-hoc 签名只能本机跑（无公证、无 App Sandbox）。详见 [docs/shell.md](docs/shell.md)。
 
+## 重试闭环（护栏 FAIL → 打回 → 重做 → 通过）
+
+「能自动执行」的核心不是模型一次写对，而是**写错了能不能自己回来**。`scripts/demo-retry.mjs` 就是这条链路的自动化验收：给 coder 加一层 `WB_FAULT=tautology` 的故障注入（`src/runner/providers/faulty.mjs`），在 **attempt 0** 把 `assert.equal(calc(2,3,'+'), 5)` 改写成 `assert.equal(calc(2,3,'+'), calc(2,3,'+'))`，然后看护栏能不能抓住、系统能不能自己重做。
+
+```bash
+# mock 版（4 秒，验证链路本身）
+WB_ENGINE=mock WB_MOCK_SCENARIO=good WB_FAULT=tautology node scripts/demo-retry.mjs --fresh
+
+# 真引擎版（2 分钟，验证真实模型 + 真实 token）
+WB_ENGINE=opencode WB_MODEL=gptagent/deepseek-v4.1-flash \
+  WB_FAULT=tautology WB_BUDGET=2500000 node scripts/demo-retry.mjs --fresh
+```
+
+实跑输出（2026-11-22，真引擎）：
+
+```
+[fault] attempt 0 注入同义反复测试: test/calc.test.mjs×7
+attempt.started #1                      coder    121468 token
+verify FAIL  no_tautological_test:      verifier  47895 token
+  test/calc.test.mjs:5 断言的期望值与实际值完全一样: calc(2, 3, '+')
+task.transition verifying -> implementing (verify failed: no_tautological_test)
+attempt.started #2（已 git reset 回基线）coder    124851 token
+verify PASS 全绿                        verifier  47988 token
+终态=awaiting_human attempts=2 spent=534379
+链路成立：FAIL → 打回 → 重置 → 重做 → 通过 → awaiting_human
+```
+
+这条演示在写的时候**真的抓出一个假绿**：`src/runner/guards.mjs` 过去只有在实现函数里存在"调用"（`Math.pow`、同文件辅助函数）时才检查同义反复；实现只用运算符（`a + b`、`a ** b`）时检查直接短路，`assert.equal(f(x), f(x))` 这种恒真断言完全逃过去。现在「两边是同一表达式」这条判据被提到与实现无关的位置（`sameExpression()`），实现只剩运算符也照抓。回归用例见 `tests/guards-tautology.test.mjs` 最后一条。
+
 ## v0 不做什么（故意的）
 
 - 不做多人实时协作（多租户 = 5 倍工作量）；多人场景先用「一台 Mac 当 runner + 内网 + 单 token」，owner 绑唯一 reviewer。
@@ -174,6 +203,6 @@ src/server/   HTTP + 静态审阅界面
 web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
-scripts/      demo 重置、引擎体检（engine-smoke）、真引擎基准（bench）
+scripts/      demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）
 apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView，方案 2 第一步）
 ```

@@ -167,14 +167,24 @@ const ASSERT_CALLS = [
   /\.(?:toBe|toEqual|toStrictEqual)\s*\(/g,
 ];
 
+/**
+ * 断言的"实际值"和"期望值"是不是同一个表达式（忽略空白与引号风格）。
+ * 例：calc(2,3) vs calc(2, 3)、pow(2,0.5) vs pow(2,"0.5" 不算，引号统一后才算)。
+ * 这是与实现无关的恒真判据 —— 实现只用运算符时也必须检查。
+ */
+export function sameExpression(a, b) {
+  const norm = (x) => String(x || "").replace(/\s+/g, "").replace(/["']/g, '"');
+  const x = norm(a), y = norm(b);
+  return Boolean(x) && x === y && x.includes("(");
+}
+
 /** 判断期望值是不是"实现里同一个调用"的复制品；返回命中的调用名或 null。 */
 export function tautologyIn(actual, expected, fnName, callees) {
   const a = String(actual || "").replace(/\s+/g, " ").trim();
   const b = String(expected || "").replace(/\s+/g, " ").trim();
   if (!a || !b) return null;
   // 类别一：两边是同一个表达式（含同函数不同参数）
-  const norm = (x) => x.replace(/\s+/g, "").replace(/["']/g, '"');
-  if (a.includes("(") && norm(a) === norm(b)) return a;
+  if (sameExpression(a, b)) return a;
   // 类别二：期望值是纯调用，且这个调用正是实现内部的实现手段
   const pure = /^[A-Za-z_$][\w$.]*\s*\([\s\S]*\)$/.exec(b);
   if (!pure) return null;
@@ -256,38 +266,46 @@ export function runGuards({ workdir, base, config, extra }) {
     }
   }
   const tautologies = [];
-  if (implFns.size) {
-    const testFiles = files.filter((f) =>
-      TEST_FILE_RE.test(f.path) && (f.status === "A" || f.status === "M"));
-    for (const f of testFiles) {
-      let src = "";
-      try { src = readFileSync(join(workdir, f.path), "utf8"); } catch { continue; }
-      src.split("\n").forEach((line, idx) => {
-        if (line.length > 600) return;
-        for (const re of ASSERT_CALLS) {
-          re.lastIndex = 0;
-          let m;
-          while ((m = re.exec(line))) {
-            const openIdx = line.indexOf("(", m.index + m[0].length - 1);
-            const args = splitTopLevelArgs(sliceBalanced(line, openIdx).body);
-            if (args.length < 2) continue;
-            for (const [fnName, meta] of implFns) {
-              if (!new RegExp("\\b" + fnName + "\\s*\\(").test(line)) continue;
-              const hit = tautologyIn(args[0], args[1], fnName, meta.callees)
-                || tautologyIn(args[1], args[0], fnName, meta.callees);
-              if (!hit) continue;
-              tautologies.push(f.path + ":" + (idx + 1) + " 「" + fnName + "」的期望值就是实现里的 " + hit);
-            }
+  const testFiles = files.filter((f) =>
+    TEST_FILE_RE.test(f.path) && (f.status === "A" || f.status === "M"));
+  for (const f of testFiles) {
+    let src = "";
+    try { src = readFileSync(join(workdir, f.path), "utf8"); } catch { continue; }
+    src.split("\n").forEach((line, idx) => {
+      if (line.length > 600) return;
+      for (const re of ASSERT_CALLS) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(line))) {
+          const openIdx = line.indexOf("(", m.index + m[0].length - 1);
+          const args = splitTopLevelArgs(sliceBalanced(line, openIdx).body);
+          if (args.length < 2) continue;
+          // 类别一：断言的期望值与实际值是同一表达式 —— 恒真，与实现长什么样无关。
+          // 必须放在 implFns 门之外：实现只用运算符（a+b / a**b）时 implFns 为空，
+          // 否则 assert.equal(calc(2,3), calc(2,3)) 会直接漏过去。
+          if (sameExpression(args[0], args[1])) {
+            tautologies.push(f.path + ":" + (idx + 1) + " 断言的期望值与实际值完全一样: " + args[0].trim());
+            continue;
+          }
+          // 类别二：期望值是实现内部同一个调用的复制品（需要实现信息）。
+          for (const [fnName, meta] of implFns) {
+            if (!new RegExp("\\b" + fnName + "\\s*\\(").test(line)) continue;
+            const hit = tautologyIn(args[0], args[1], fnName, meta.callees)
+              || tautologyIn(args[1], args[0], fnName, meta.callees);
+            if (!hit) continue;
+            tautologies.push(f.path + ":" + (idx + 1) + " 「" + fnName + "」的期望值就是实现里的 " + hit);
           }
         }
-      });
-    }
+      }
+    });
   }
   checks.push({
     id: "no_tautological_test",
     ok: tautologies.length === 0,
     detail: tautologies.length === 0
-      ? (implFns.size ? "断言未复制实现内部的调用" : "未发现可复制的实现调用（实现只用字面量/入参）")
+      ? (implFns.size
+        ? "断言未复制实现内部的调用，两边也不是同一表达式"
+        : "实现只含字面量/入参：已按「两边同一表达式」检查，未发现恒真断言")
       : "同义反复测试（测不出实现错）: " + tautologies.join("；"),
   });
 
