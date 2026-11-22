@@ -107,6 +107,15 @@ WB_WORKSPACE=/tmp/wb-pkg-ws WB_PORT=7601 WB_SHELL_SMOKE=1 \
 不建窗口，只做「定位内核 → 解析/准备工作区 → attach 或起 server+worker → 请求 `/api/tasks` 与 `/api/workspace`」：
 
 ```bash
+# 一条命令跑完「提交任务 → 自动执行 → 到待裁决 → 退出无孤儿」，不用看窗口
+node scripts/verify-package.mjs --port 7641
+# app=.../dist/Workbench.app
+# workspace={"root":"/tmp/wb-pkg-.../ws","code":".../Contents/Resources/kernel",...}
+# states=queued → verifying → awaiting_human
+# PASS 离仓可运行 / 工作区正确 / worker 真跑 / 退出无孤儿
+```
+
+```bash
 # attach 到已在跑的 7317
 WB_SHELL_SMOKE=1 dist/Workbench.app/Contents/MacOS/Workbench
 # workspace=/Users/liujie/Workbench workspaceSource=默认 ~/Workbench starterRepo=/Users/liujie/Workbench/demo
