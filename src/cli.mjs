@@ -3,7 +3,8 @@ import { openDb } from "./core/db.mjs";
 import { createTask, getTask, listTasks, rebuild } from "./core/ledger.mjs";
 import { readForTask } from "./core/events.mjs";
 import { getProvider, listProviders } from "./runner/engine.mjs";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
+import { join } from "node:path";
 import { BUILTIN_ENGINES } from "./runner/providers/index.mjs";
 
 function arg(name, def) {
@@ -55,12 +56,18 @@ async function main() {
     await pump(db, { workerId: arg("worker", hostname() + ":" + process.pid), provider, once: process.argv.includes("--once") });
     return;
   }
+  if (cmd === "workspace") {
+    const { ensureWorkspace } = await import("./core/workspace.mjs");
+    const w = ensureWorkspace(arg("dir", process.env.WB_WORKSPACE || join(homedir(), "Workbench")));
+    process.stdout.write(JSON.stringify(w) + "\n");
+    return;
+  }
   if (cmd === "serve") {
     const { startServer } = await import("./server/index.mjs");
     startServer();
     return;
   }
-  process.stdout.write("用法: cli.mjs <init|enqueue|status|rebuild|run|serve>\n");
+  process.stdout.write("用法: cli.mjs <init|workspace|enqueue|status|rebuild|run|serve>\n");
 }
 
 main().catch((e) => { process.stderr.write(String(e && e.stack || e) + "\n"); process.exit(1); });

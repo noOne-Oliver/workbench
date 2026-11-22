@@ -43,3 +43,9 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .dl.d { color: #ffa198; background: rgba(248,81,73,.08); }
 .dl.h { color: #79c0ff; }
 .dl.f { color: var(--dim); }
+#compose { padding: 12px 24px 0; }
+#new-task { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+#new-task input { background: #0b0f14; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+#new-task input[type="number"] { width: 110px; }
+#compose-msg { color: var(--ok); font-size: 12px; }
+#ws-info { color: var(--dim); margin-top: 6px; word-break: break-all; }

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
-import { runGuards, extractFunctions, calleesOf, tautologyIn } from "../src/runner/guards.mjs";
+import { runGuards, extractFunctions, calleesOf, tautologyIn, testCommandFor } from "../src/runner/guards.mjs";
 
 const chk = (g, id) => g.checks.find((c) => c.id === id);
 
@@ -178,5 +178,31 @@ test("实现只含运算符时，恒真断言也必须被抓（曾经的假绿�
   assert.equal(c.ok, false, "实现只用运算符时，两边同一表达式仍是恒真断言");
   assert.match(c.detail, /calc\.test\.mjs:4/, "要指出具体哪一行");
   assert.match(c.detail, /期望值与实际值/, "要说清是哪类同义反复");
+});
+
+test("没有 npm 的机器（打包后的 app）退回 node --test，不能把「跑不起来」当「测试不过」", () => {
+  assert.deepEqual(testCommandFor({ testCmd: ["npm", "test"] }, { npmOk: false }).cmd, [process.execPath, "--test"]);
+  assert.match(testCommandFor({ testCmd: ["npm", "test"] }, { npmOk: false }).note, /node --test/);
+  assert.deepEqual(testCommandFor({ testCmd: ["npm", "test"] }, { npmOk: true }).cmd, ["npm", "test"]);
+  assert.deepEqual(testCommandFor({ testCmd: ["node", "--test"] }, { npmOk: false }).cmd, ["node", "--test"], "自定义命令不许被改");
+
+  const { repo, base } = repoWith({
+    "src/calc.mjs": "export function calc(a, b) {\n  return a + b;\n}\n",
+    "test/calc.test.mjs": [
+      'import test from "node:test";',
+      'import assert from "node:assert/strict";',
+      'import { calc } from "../src/calc.mjs";',
+      'test("add", () => { assert.equal(calc(2, 3), 5); });',
+    ].join("\n"),
+  });
+  process.env.WB_NO_NPM = "1";
+  try {
+    const g = runGuards({ workdir: repo, base });
+    const c = chk(g, "tests_pass");
+    assert.equal(c.ok, true, "没有 npm 也要真跑起来测试");
+    assert.match(c.detail, /退回 node --test/);
+  } finally {
+    delete process.env.WB_NO_NPM;
+  }
 });
 

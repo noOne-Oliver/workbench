@@ -5,8 +5,11 @@ import { openDb } from "../core/db.mjs";
 import { createTask, getTask, listTasks, transition, record, addEvidence } from "../core/ledger.mjs";
 import { readForTask } from "../core/events.mjs";
 
+// ROOT = 工作区（账本、worktrees、凭据都写这里）；CODE = 内核代码目录（打包后是 app 内的 Resources/kernel）。
+// 两者分开，才能把内核塞进 .app 而数据留在用户自己的工作区。
 const ROOT = resolve(process.env.WB_ROOT || process.cwd());
-const WEB = resolve(ROOT, "web");
+const CODE = resolve(process.env.WB_CODE || ROOT);
+const WEB = resolve(CODE, "web");
 const TOKEN = process.env.WB_TOKEN || "";
 const PORT = Number(process.env.WB_PORT || 7317);
 const HOST = process.env.WB_HOST || "127.0.0.1";
@@ -43,6 +46,13 @@ export function createApp(db) {
       if (req.method === "GET" && path === "/api/tasks") {
         const state = url.searchParams.get("state");
         return json(res, 200, { tasks: listTasks(db, { state: state || null }) });
+      }
+      if (req.method === "GET" && path === "/api/workspace") {
+        return json(res, 200, {
+          root: ROOT, code: CODE,
+          starterRepo: resolve(ROOT, "demo"),
+          engine: process.env.WB_ENGINE || "mock",
+        });
       }
       if (req.method === "POST" && path === "/api/tasks") {
         const b = await readBody(req);

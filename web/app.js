@@ -110,5 +110,38 @@ if (meInput) {
   });
 }
 
+// 新建任务：打包后的 app 没有终端，这里是唯一入口。
+async function loadWorkspace() {
+  try {
+    const r = await api("/api/workspace");
+    const w = await r.json();
+    const info = el("ws-info");
+    if (info) info.textContent = "工作区 " + w.root + " · 内核 " + w.code + " · 引擎 " + w.engine;
+    const repo = el("t-repo");
+    if (repo && !repo.value) repo.value = w.starterRepo;
+  } catch { /* 老内核没有这个接口，忽略 */ }
+}
+
+const composeForm = el("new-task");
+if (composeForm) {
+  composeForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const body = {
+      title: el("t-title").value.trim(),
+      repo: el("t-repo").value.trim(),
+      owner: ME,
+      budgetTokens: Number(el("t-budget").value || 1000000),
+    };
+    const r = await api("/api/tasks", { method: "POST", body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!r.ok) { alert(j.error || "提交失败"); return; }
+    el("t-title").value = "";
+    const msg = el("compose-msg");
+    if (msg) { msg.textContent = "已提交 " + j.task.id + " · 后台会自动开跑，到待裁决时再找你"; setTimeout(() => { msg.textContent = ""; }, 8000); }
+    await load();
+  });
+}
+
+loadWorkspace();
 load();
 setInterval(load, 2500);

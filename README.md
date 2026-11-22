@@ -59,6 +59,7 @@ queued → planning → implementing → verifying → reviewing → awaiting_hu
 
 ```bash
 node src/cli.mjs init                              # 建库 + 建 demo 仓库
+node src/cli.mjs workspace [--dir ~/Workbench]     # 建一个工作区（data/ worktrees/ .oc/ + 起始仓库 demo/），幂等
 node src/cli.mjs enqueue --title "..." --repo <dir> [--owner <name>] [--budget 1000000]
 node src/cli.mjs status [--id <task>]              # 看任务与事件流
 node src/cli.mjs rebuild                           # 从事件全量重建投影（自愈）
@@ -82,6 +83,10 @@ npm test                                           # 内核测试（状态机/�
 | `WB_MODEL` | 空 | opencode 用的模型 |
 | `WB_OC_HOME` | `./.oc` | opencode 的 XDG 数据目录（见下节：它必须能写，否则直接崩） |
 | `WB_BUDGET` | `1000000` | 单任务 token 预算；真引擎一个任务约 36–48 万，20 万会中途熔断 |
+| `WB_ROOT` | 当前目录 | **数据根**：账本、worktree、起始仓库都在它下面 |
+| `WB_CODE` | 同 `WB_ROOT` | **代码根**：`web/` 从 `WB_CODE/web` 取。打包成 app 后这两个不是一回事，见「桌面外壳」 |
+| `WB_WORKSPACE` | 空 | app 用：工作区目录（优先级最高，压过 UserDefaults 里存的选择） |
+| `WB_NO_NPM` | 空 | 设成 1 强制让护栏走 `node --test`，用来复现「机器上没有 npm」的退路 |
 
 ## 五条验收怎么复现
 
@@ -139,6 +144,8 @@ divzero    awaiting_human      1   477178   311 pass
 
 ## 桌面外壳（方案 2）
 
+打包后没有终端，所以**界面里能直接建任务**：顶部「＋ 新建任务」填一句话、目标仓库、token 预算，提交就走 `POST /api/tasks`，worker 自动开跑；页面上的工作区/内核/引擎路径来自 `GET /api/workspace`（用来一眼看出这次连的是哪个内核、哪个工作区）。
+
 `apps/macshell/` 用 Swift + AppKit + WKWebView 把上面那个三栏收件箱装进一个原生窗口，**界面逻辑一行没改**；
 并且**把内核一起打包进 app**：`Contents/Resources/kernel/` 里是打包用的 node、内核（`src/`）和前端（`web/`）。
 所以 app 拷到 `/tmp`、拷到 `/Applications` 都能直接跑 —— 不需要仓库，也不需要本机装 node。
@@ -165,6 +172,12 @@ WB_SHELL_SHOT=docs/shell-shot.png dist/Workbench.app/Contents/MacOS/Workbench
 上面这张图就是这条命令在真 app 里抓下来的，不是浏览器截图：**窗口真的把收件箱画出来了**（DOM 断言 3 张卡片、正文含任务标题与预算）。
 
 边界：ad-hoc 签名只能本机跑（无公证、无 App Sandbox）；`kernel/node` 是 homebrew 的动态链接版，换机器要重新 `build.sh`。详见 [docs/shell.md](docs/shell.md)。
+
+打包有没有真的可用，跑一条命令就知道（它会拿 `.app` 当已安装产物、故意在 `/tmp` 里起、提交一个任务、等它到待裁决、再确认退出不留孤儿）：
+
+```bash
+npm run verify:package -- --port 7641   # PASS 离仓可运行 / 工作区正确 / worker 真跑 / 退出无孤儿
+```
 
 ## 重试闭环（护栏 FAIL → 打回 → 重做 → 通过）
 
@@ -204,12 +217,12 @@ verify PASS 全绿                        verifier  47988 token
 ## 目录
 
 ```
-src/core/     账本、事件、状态机、租约
+src/core/     账本、事件、状态机、租约、工作区（workspace.mjs）
 src/runner/   worker 循环、SOP 提示词、护栏、worktree、引擎 provider
 src/server/   HTTP + 静态审阅界面
-web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档）
+web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档 + 新建任务表单）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
-scripts/      demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）
+scripts/      demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）、打包复验（verify-package）
 apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView；内核打包进 app，离仓可运行）
 ```

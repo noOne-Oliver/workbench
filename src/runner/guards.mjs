@@ -12,6 +12,23 @@ const ASSERT_RE = /\b(assert|expect|should|XCTAssert|#expect)\b/;
 
 const DEFAULTS = { testCmd: ["npm", "test"], sizeLimitLines: 600, testTimeoutMs: 300000 };
 
+/** 本机有没有可用的 npm：打包后的 app 只带 node，没有 npm。 */
+const NPM_OK = (() => {
+  try { return sh("npm", ["--version"], { timeout: 10000 }).ok; } catch { return false; }
+})();
+
+/**
+ * 测试命令：默认 npm test，但打包环境里没有 npm 时要能退回 node --test，
+ * 否则「护栏跑不起来」会被误读成「测试不过」，每个任务都会平白打回。
+ */
+export function testCommandFor(cfg, opts) {
+  const npmOk = opts && "npmOk" in opts ? opts.npmOk : (process.env.WB_NO_NPM ? false : NPM_OK);
+  const raw = (cfg && cfg.testCmd) || DEFAULTS.testCmd;
+  const cmd = Array.isArray(raw) ? raw.slice() : String(raw).split(/\s+/).filter(Boolean);
+  if (cmd[0] !== "npm" || npmOk) return { cmd, note: "" };
+  return { cmd: [process.execPath, "--test"], note: "本机没有可用的 npm，已退回 node --test；" };
+}
+
 export function loadRepoConfig(workdir) {
   const p = join(workdir, "wb.config.json");
   if (!existsSync(p)) return { ...DEFAULTS };
@@ -202,12 +219,12 @@ export function runGuards({ workdir, base, config, extra }) {
   const files = changedFiles(workdir, base);
 
   // 1. 测试必须真的跑，且真的绿
-  const cmd = cfg.testCmd || DEFAULTS.testCmd;
+  const { cmd, note } = testCommandFor(cfg);
   const run = sh(cmd[0], cmd.slice(1), { cwd: workdir, timeout: cfg.testTimeoutMs || DEFAULTS.testTimeoutMs });
   checks.push({
     id: "tests_pass",
     ok: run.ok,
-    detail: run.ok ? "测试命令退出码 0" : "测试命令失败（exit " + run.code + "）",
+    detail: note + (run.ok ? "测试命令退出码 0" : "测试命令失败（exit " + run.code + "）"),
   });
 
   // 2. 不许把测试改弱：删文件、或断言/用例数变少都算削弱。
