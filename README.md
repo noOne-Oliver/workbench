@@ -382,9 +382,39 @@ npm run bench:real -- --tasks 2   # mock 也能跑，3 秒验完度量本身
 
 **别读成「成本问题解决了」**：
 
-1. 这一套 5 单现在**全部命中 small**，所以它证明的是「小改动省一半」；normal / large 的路径一次都没被真跑过（只有单元测试兜着）。下一轮基准得故意混进改多文件的活，否则这条快路径等于没被反证过。
+1. 这一套 5 单现在**全部命中 small**，所以它证明的是「小改动省一半」；normal / large 的路径当时一次都没被真跑过（只有单元测试兜着）——下一节已经补上混跑。
 2. 省钱来自「少调三次」，不是「调得更便宜」。单次调用还是 6~17 万 token（harness + 推理），再往下压只能继续减调用次数——下一个该问的是「Verifier 能不能和 Coder 合成一次」，但那等于让写代码的人自己判卷，我倾向于不换。
 3. 快路径把方案责任推给了 Coder：没有上游拆解，它得一次想清接口形状。这次 5/5 能过是因为任务都有明确验收；换成「需求本身模糊」的小改动，跳过拆解可能反而多跑一轮，而一轮就是 21 万。所以这条规则该按「初筛打回率」持续校准，不是一劳永逸。
+
+### 混着跑：small / normal / large + 一次确定性降级（2026-11-22 深夜）
+
+上一节末尾留的作业是「normal / large 一次都没被真跑过」。这一轮把套件换成混跑，并且每单写死「该出现哪几个角色」，跑完自动对账——体量分级是确定性规则，跑错了就是代码错了，不能让报告里悄悄少一次 reviewer 还看着像成功。
+
+| 任务 | 体量 | 角色序列 | 尝试 | token | 机器秒 |
+| --- | --- | --- | --- | --- | --- |
+| slugify | small | coder → verifier | 1 | 210,118 | 48 |
+| median | small | coder → verifier | 1 | 212,781 | 46 |
+| merge-utils | normal | lead → coder → verifier → reviewer | 1 | 417,776 | 97 |
+| truncate-long | normal | lead → coder → verifier → reviewer | 1 | 611,112 | 172 |
+| refactor-range | large | lead → architect → coder → verifier → reviewer | 1 | 622,392 | 186 |
+| fastpath-retry | small | coder → verifier → lead → coder → verifier → reviewer | 2 | 829,423 | 205 |
+| **合计 6 单** | — | 6/6 完成 | — | **2,903,602** | 墙钟 755 秒 |
+
+按体量看每单成本：**small 约 21 万；normal 42~61 万；large 62 万**。normal 比 small 贵出来的正是 lead（出方案）和 reviewer（多一道判卷）——这两段买的是「多模块会踩到的边界」，不是浪费。token 按角色：coder 1,410,928（48.6%）、verifier 634,020（21.8%）、reviewer 454,476（15.7%）、lead 330,689（11.4%）、architect 73,489（2.5%）。平均 483,934/单、平均机器 126 秒。
+
+降级路径这次真的跑到了：`fastpath-retry` 由脚本注入一条同义反复断言（期望值直接抄实现调用），第一次必然被 `no_tautological_test` 抓住 → 自动补方案（lead）→ 第二次通过，attempts=2，角色序列与预期一致。
+
+#### 这一轮撞出来的三个真问题（都已封死）
+
+1. **容器化靠不住**：coder 顺着 worktree 的 `.git` 找到主仓库，把测试文件写进了主仓库 → 主仓库变脏 → `git merge` 拒绝执行 → 任务卡在「等待批准」，人看到的只有一句 `merge conflict, needs human`。修法（`src/runner/worktree.mjs` + `worker.doImplement`）：coder 跑之前拍一次主仓库状态，跑完只还原「这次才变脏」的路径——**别人未提交的改动一个字都不碰**——并落 `workspace.restored` 事件与 `evidence.containment`。prompt 里也写死了「只改当前目录，主仓库不要写」。
+2. **合并前不查主仓库干净**（`worker.doMerge`）：现在先看 `git status --porcelain`，脏就直接 `blocked` 并指名道姓列出文件（「先提交或清理这些改动，再重试合并」），不再让 git 甩黑话；状态机相应允许 `merging → blocked`。
+3. **normal 之前还在跑 lead + architect**（README 写的是 coder → verifier → reviewer）、**快路径失败后重试拿不到方案**（规划段不会再跑）。已按 README 改：只有 large 才调 architect；`verifying` 失败且没有方案时回 `queued` 补方案（状态机加 `verifying → queued`）。
+
+对账口径：重试会额外插进 coder → verifier 的对，所以只对「角色**首次出现**的顺序」对账；体量判错（normal 少一次 lead、small 多一次 architect、large 缺 architect）会立刻红。
+
+复现：`WB_ENGINE=opencode WB_MODEL=gptagent/deepseek-v4.1-flash npm run bench:real -- --fresh --tasks 6`（约 13 分钟、约 290 万 token）。报告 `docs/bench-real-2026-11-22T13-25-24-476Z.json`。
+
+**「一次过率 100%」别读成稳定**：这 6 单都还在模型能力范围内，失败率要拿「需求本身模糊」的活去跑才有意义；这套混跑证明的是**降级路径真的能走通**，不是「不会失败」。
 ### 进程管理
 
 ```bash

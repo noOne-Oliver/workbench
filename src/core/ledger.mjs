@@ -17,12 +17,14 @@ export const TRANSITIONS = {
   queued:            ["planning", "blocked", "failed"],
   planning:          ["implementing", "queued", "blocked", "failed"],
   implementing:      ["verifying", "queued", "blocked", "failed"],
-  verifying:         ["reviewing", "implementing", "blocked", "failed"],
+  // queued = 快路径没过、需要先补方案（见 worker.doVerify）
+  verifying:         ["reviewing", "implementing", "queued", "blocked", "failed"],
   reviewing:         ["awaiting_review", "implementing", "blocked", "failed"],
   awaiting_review:   ["awaiting_approval", "queued", "blocked", "failed"],
   awaiting_approval: ["merging", "queued", "failed"],
   awaiting_human:    ["awaiting_approval", "merging", "queued", "failed"],
-  merging:           ["done", "awaiting_approval", "failed"],
+  // blocked：主仓库有未提交改动，合并会失败——等人清理，不是让 worker 空转
+  merging:           ["done", "awaiting_approval", "blocked", "failed"],
   done:              [],
   failed:            ["queued"],
   blocked:           ["queued"],

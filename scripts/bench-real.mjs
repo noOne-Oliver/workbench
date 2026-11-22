@@ -27,27 +27,48 @@ const arg = (name, def) => {
   return i > -1 ? process.argv[i + 1] : def;
 };
 
-/** 五个独立小任务，覆盖「从零实现 / 加函数 / 修 bug / 边界条件 / 字符串处理」五类。 */
+/**
+ * 混着跑的套件：small / normal / large 各来几单，最后再加一单「快路径失败 → 降级重试」。
+ * 每单都写死「应该出现哪几个角色」，跑完对账——体量分级是确定性规则，跑错了就是代码错了，
+ * 不能让报告里悄悄少一次 reviewer 还看着像成功。
+ */
 const SUITE = [
   {
     key: "slugify",
+    size: "small",
+    roles: ["coder", "verifier"],
     title: "实现 src/text.mjs 导出 slugify(s)：转小写、非字母数字转 -、去首尾 -、连续 - 压成一个",
   },
   {
     key: "median",
+    size: "small",
+    roles: ["coder", "verifier"],
     title: "实现 src/num.mjs 导出 median(nums)：偶数个取中间两数均值，空数组抛 Error('empty')",
   },
   {
-    key: "range-bug",
-    title: "修 bug：parseRange('5-3') 现在返回 [5,3]，应抛 Error('invalid range')，并补测试",
+    key: "merge-utils",
+    size: "normal",
+    roles: ["lead", "coder", "verifier", "reviewer"],
+    title: "把 src/text.mjs 的 slugify 与 src/num.mjs 的 median 收进 src/utils.mjs，原文件改为 re-export，补测试",
   },
   {
-    key: "clamp",
-    title: "给 src/num.mjs 加 clamp(n, min, max)（越界夹到边界，min>max 抛 Error('bad range')），并补测试",
+    key: "truncate-long",
+    size: "normal",
+    roles: ["lead", "coder", "verifier", "reviewer"],
+    title: "给 src/text.mjs 加 truncate(s, n)：超长时截断并补省略号，省略号计入总长；n<=0 或 n 小于省略号长度时返回空串；字符串含代理对（emoji）时不得截断半个字符，要按完整码点处理；另需处理首尾空白与连续空格的折叠，并补覆盖上述各分支的测试",
   },
   {
-    key: "truncate",
-    title: "给 src/text.mjs 加 truncate(s, n)：超长截断并补 '…'（含省略号总长不超过 n），并补测试",
+    key: "refactor-range",
+    size: "large",
+    roles: ["lead", "architect", "coder", "verifier", "reviewer"],
+    title: "重构 src/range.mjs 的区间解析：支持 '1-5,8,10-12' 多段与逆序区间报错 Error('invalid range')，保持纯函数（并发安全），并补测试",
+  },
+  {
+    key: "fastpath-retry",
+    size: "small",
+    attempts: 2,
+    roles: ["coder", "verifier", "lead", "coder", "verifier", "reviewer"],
+    title: "给 src/text.mjs 加 reverse(s)：按码点反转，emoji 不得拆开，并补测试",
   },
 ];
 
@@ -116,7 +137,35 @@ await import("../src/runner/providers/index.mjs");
 const { pump } = await import("../src/runner/worker.mjs");
 
 const db = openDb(DB);
-const provider = await getProvider(engineName, { model, home: OC_HOME });
+const baseProvider = await getProvider(engineName, { model, home: OC_HOME });
+
+/**
+ * 降级路径得能被观察到：给 fastpath-retry 这一单在 coder 第 0 次尝试后写一条同义反复断言。
+ * 它是确定性的——no_tautological_test 必然抓住它——所以「第一次没过 → 重试补方案 → 通过」
+ * 不是靠模型心情，而是靠注入。
+ */
+let faultKey = null;
+const provider = {
+  ...baseProvider,
+  async run(args) {
+    const res = await baseProvider.run(args);
+    if (faultKey === "fastpath-retry" && args.role === "coder" && (args.attempt ?? 0) === 0 && res.ok) {
+      const file = join(args.cwd, "test/retry.test.mjs");
+      writeFileSync(file, [
+        "import test from \"node:test\";",
+        "import assert from \"node:assert\";",
+        "import { truncate } from \"../src/text.mjs\";",
+        "",
+        "test(\"truncate 边界\", () => {",
+        "  assert.equal(truncate(\"hello world\", 8), truncate(\"hello world\", 8));",
+        "});",
+        "",
+      ].join("\n"));
+      console.log("  [fault] 往 test/retry.test.mjs 注入同义反复断言（期望值 = 实现调用）");
+    }
+    return res;
+  },
+};
 const workerId = "bench-real:" + process.pid;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -145,13 +194,17 @@ const totalStart = Date.now();
 
 for (let i = 0; i < limit; i++) {
   const spec = SUITE[i];
+  faultKey = spec.key;
   const task = createTask(db, { title: spec.title, repo: "repo", owner: "alice", budgetTokens: budget });
   const t0 = Date.now();
-  console.log("\n[" + (i + 1) + "/" + limit + "] " + task.id + " " + spec.key);
+  console.log("\n[" + (i + 1) + "/" + limit + "] " + task.id + " " + spec.key + " (期望 " + spec.size + ")");
 
   let t = await pumpUntil(task.id, ["awaiting_review", "done", "blocked", "failed"]);
   const machineSec = Math.round((Date.now() - t0) / 1000);
+  const roles = db.prepare("SELECT payload FROM events WHERE task_id=? AND type='agent.started' ORDER BY id").all(task.id)
+    .map((e) => JSON.parse(e.payload).role);
   console.log("  机器段: " + t.state + " attempts=" + t.attempts + " spent=" + t.spent_tokens + " (" + machineSec + "s)");
+  console.log("  体量: " + ((t.evidence && t.evidence.size) || "?") + "  角色: " + roles.join(" → "));
 
   let reviewSec = null;
   let approvalSec = null;
@@ -175,10 +228,27 @@ for (let i = 0; i < limit; i++) {
   const guards = (ev.verify && ev.verify.guards) || [];
   const merge = db.prepare("SELECT payload FROM events WHERE task_id=? AND type='merge.done' ORDER BY id DESC LIMIT 1").get(t.id);
   const tc = (ev.verify && ev.verify.testCases) || {};
+  // 对账：体量分级 + 角色序列是确定性规则，跑错了就是代码错了，不能悄悄少一次 reviewer。
+  const checks = [];
+  const size = (t.evidence && t.evidence.size) || null;
+  if (size !== spec.size) checks.push("体量应为 " + spec.size + "，实际 " + size);
+  // 重试会额外插进 coder→verifier 的对（护栏打回是正常现象），所以只对「角色首次出现的顺序」对账：
+  // 体量分级的错误（normal 少一次 lead、small 多一次 architect、large 缺 architect）都会在这里露出来。
+  const seen = [...new Set(roles)];
+  const want = [...new Set(spec.roles)];
+  if (seen.join(",") !== want.join(",")) checks.push("角色顺序应为 [" + want.join(",") + "]，实际 [" + seen.join(",") + "]（完整 " + roles.join(" → ") + "）");
+  if (spec.attempts && t.attempts !== spec.attempts) checks.push("尝试次数应为 " + spec.attempts + "，实际 " + t.attempts);
+  if (t.state !== "done") checks.push("终态应为 done，实际 " + t.state);
+  if (checks.length) console.log("  ✗ 对账失败: " + checks.join("；"));
+  else console.log("  ✓ 对账通过");
+
   rows.push({
     key: spec.key,
     id: t.id,
     title: spec.title,
+    size,
+    roles,
+    checks,
     state: t.state,
     attempts: t.attempts,
     tokens: t.spent_tokens,
@@ -209,6 +279,8 @@ const summary = {
   avg_machine_seconds: ok.length ? Math.round(ok.reduce((s, r) => s + r.machine_seconds, 0) / ok.length) : 0,
   total_seconds: totalSec,
   retried: rows.filter((r) => r.attempts > 1).length,
+  sizes: rows.reduce((m, r) => { m[r.size || "?"] = (m[r.size || "?"] || 0) + 1; return m; }, {}),
+  checks_failed: rows.filter((r) => r.checks.length).map((r) => ({ key: r.key, checks: r.checks })),
   human_decisions: ok.length * 2,
   tokens_by_role: db.prepare("SELECT payload FROM events WHERE type='budget.spent'").all().reduce((m, e) => {
     const p = JSON.parse(e.payload);
@@ -230,5 +302,10 @@ for (const r of rows) {
 }
 console.log("\n一次过率 " + (summary.success_rate * 100).toFixed(0) + "%  (" + summary.done + "/" + summary.tasks + ")" +
   "  平均 " + summary.avg_tokens + " token/单  平均机器 " + summary.avg_machine_seconds + "s  总墙钟 " + totalSec + "s");
+if (summary.checks_failed.length) {
+  console.log("\n对账失败：" + summary.checks_failed.map((c) => c.key).join(", "));
+} else {
+  console.log("\n对账全过（体量 / 角色序列 / 尝试次数 / 终态）");
+}
 console.log("报告 " + REPORT);
-process.exit(ok.length === rows.length ? 0 : 2);
+process.exit(ok.length === rows.length && summary.checks_failed.length === 0 ? 0 : 2);

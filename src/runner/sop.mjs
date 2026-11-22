@@ -63,6 +63,10 @@ export function coderPrompt(task, plan, attempt, feedback) {
     "",
     "在仓库里完成实现，并补上覆盖该实现的测试。改完自测通过即可。",
     "不要修改既有测试文件来迁就实现。",
+    // 真事：coder 顺着 worktree 的 .git 找到主仓库，把测试写到了主仓库里，
+    // 于是主仓库变脏、merge 被 git 拒掉，整轮验证作废。边界要写在 prompt 里。
+    "只改当前工作目录（你自己所在的仓库副本）里的文件；主仓库和其他目录都不要写入，",
+    "也不要对它们执行 git checkout / reset / stash / clean。",
   );
   // 重试必须带上"上一轮为什么没过"，否则就是无脑重试：同样的错会被原样再犯一次。
   if (feedback) lines.push("", "## 上一轮为什么没过（这次必须改掉）", String(feedback));

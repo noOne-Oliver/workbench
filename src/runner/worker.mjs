@@ -3,7 +3,7 @@ import { getTask, listTasks, transition, record, spendBudget, addEvidence, overB
 import { acquire, renew, release, reclaimExpired, reclaimDead } from "../core/lease.mjs";
 import { hostname } from "node:os";
 import { getProvider } from "./engine.mjs";
-import { sh, ensureWorktree, resetToBase, commitAll, diffStat, diffPatch, headSha, isGitRepo } from "./worktree.mjs";
+import { sh, ensureWorktree, resetToBase, commitAll, diffStat, diffPatch, headSha, isGitRepo, statusPorcelain, newlyDirty, restorePaths } from "./worktree.mjs";
 import { loadRepoConfig, runGuards } from "./guards.mjs";
 import { classifySize, repoFileCount } from "../core/sizing.mjs";
 import * as sop from "./sop.mjs";
@@ -165,9 +165,14 @@ async function doPlanning(db, id, ctx) {
   }
 
   const lead = await callAgent(db, id, { ...ctx, cwd: dir }, { role: "lead", prompt: sop.leadPrompt(t, repoAbs) });
-  const arch = await callAgent(db, id, { ...ctx, cwd: dir }, { role: "architect", prompt: sop.architectPrompt(t, lead.text, repoAbs) });
-  record(db, { taskId: id, type: "plan.produced", actor: "architect", payload: { plan_md: arch.text } });
-  record(db, { taskId: id, type: "slices.produced", actor: "lead", payload: { slices: lead.text } });
+  record(db, { taskId: id, type: "plan.produced", actor: "lead", payload: { plan_md: lead.text } });
+
+  // 单模块的活不需要「拆成几个切片」——那是 large 才付得起的钱。
+  // normal 保留 lead 出方案（否则 coder 连要改什么都得自己猜），砍掉 architect。
+  if (size === "large") {
+    const arch = await callAgent(db, id, { ...ctx, cwd: dir }, { role: "architect", prompt: sop.architectPrompt(t, lead.text, repoAbs) });
+    record(db, { taskId: id, type: "slices.produced", actor: "architect", payload: { slices: arch.text } });
+  }
   transition(db, id, "implementing", { actor: ctx.workerId, reason: "plan ready (" + size + ")" });
 }
 
@@ -269,11 +274,27 @@ async function doImplement(db, id, ctx) {
   t = getTask(db, id);
   const attempt = t.attempts - 1;
 
+  // 容器化靠不住：引擎能执行 shell，就可能把文件写到 worktree 外面（真实基准里 coder 顺着
+  // worktree 的 .git 找到主仓库，把测试写进去了，然后 merge 因为主仓库脏而失败）。
+  // 这里的规矩是：只还原「这次 coder 跑之前是干净的、跑完变脏了」的路径 —— 别人未提交的改动
+  // 一个字都不碰，但 coder 越界写的东西必须原样退回，否则整轮验证白做。
+  const repoBefore = statusPorcelain(repo);
+
   await callAgent(db, id, { ...ctx, cwd: dir }, {
     role: "coder",
     prompt: sop.coderPrompt(t, t.plan_md || "", attempt, retryFeedback(t, db)),
     attempt,
   });
+
+  const escaped = newlyDirty(repoBefore, statusPorcelain(repo));
+  if (escaped.length) {
+    restorePaths(repo, escaped);
+    record(db, {
+      taskId: id, type: "workspace.restored", actor: ctx.workerId,
+      payload: { files: escaped.slice(0, 20), reason: "coder 写到了 worktree 外面，已还原主仓库" },
+    });
+    addEvidence(db, id, { containment: { escaped: escaped.slice(0, 20), at: new Date().toISOString() } }, "evidence.patch");
+  }
 
   const c = commitAll(dir, "wb: " + t.title + " (attempt " + (attempt + 1) + ")");
   if (!c.ok) throw new Error("commit 失败: " + c.error);
@@ -325,6 +346,10 @@ async function doVerify(db, id, ctx) {
     transition(db, id, "reviewing", { actor: ctx.workerId, reason: "verified" });
   } else if (t.attempts >= MAX_ATTEMPTS) {
     transition(db, id, "blocked", { actor: ctx.workerId, reason: "verify failed: " + guards.failed.join(",") });
+  } else if (!(t.plan_md && String(t.plan_md).trim())) {
+    // 上一轮走的是快路径、根本没有方案，这轮失败了说明「一次想清」不成立：
+    // 回 queued 让规划段真的出一份方案，再带着失败证据重做。
+    transition(db, id, "queued", { actor: ctx.workerId, reason: "fast path failed, need a plan: " + guards.failed.join(",") });
   } else {
     transition(db, id, "implementing", { actor: ctx.workerId, reason: "verify failed: " + guards.failed.join(",") });
   }
@@ -339,7 +364,8 @@ async function doReview(db, id, ctx) {
 
   // 小改动不再多花一次 agent 调用：护栏 + 独立 Verifier 已经答完「对不对」，
   // 剩下的「要不要合」本来就是人初筛的活。跳过要留痕，否则以后没人知道这里少了一道。
-  if (t.evidence && t.evidence.size === "small") {
+  // 只在第一次尝试跳过：被打回过说明这一版有风险，多一道 reviewer 是省不得的。
+  if (t.evidence && t.evidence.size === "small" && t.attempts <= 1) {
     record(db, {
       taskId: id, type: "review.skipped", actor: ctx.workerId,
       payload: { size: "small", reason: (t.evidence.size_reason || "小改动") + "：护栏 + 独立 Verifier + 人初筛已覆盖，不再多调一次 reviewer" },
@@ -376,6 +402,14 @@ async function doMerge(db, id, ctx) {
   const t = getTask(db, id);
   const repo = resolve(ROOT, t.repo);
   const branch = t.branch || ("wb/" + id);
+  const dirty = (statusPorcelain(repo) || []).map((e) => e.code + " " + e.path);
+  if (dirty.length) {
+    const reason = "主仓库有未提交改动，合并会失败：" + dirty.slice(0, 5).join("；") +
+      (dirty.length > 5 ? " 等 " + dirty.length + " 处" : "") + "。先提交或清理这些改动，再重试合并。";
+    addEvidence(db, id, { merge_error: reason, last_error: reason, at: new Date().toISOString() }, "evidence.patch");
+    transition(db, id, "blocked", { actor: ctx.workerId, reason });
+    return;
+  }
   const r = sh("git", ["-C", repo, "merge", "--no-ff", "-m", "wb: merge " + t.title, branch]);
   if (!r.ok) {
     addEvidence(db, id, { merge_error: String(r.out).slice(-2000) }, "evidence.patch");
