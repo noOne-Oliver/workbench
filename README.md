@@ -1,9 +1,29 @@
 # 工作台 (Workbench) v0
 
 一个「AI 团队分工写代码、人只负责 review」的后台执行器。
-你提交任务 → 后台自动 规划/实现/验收/复核 → 卡在 `awaiting_human` 等你看一眼 → 你说合或不合。
+你提交任务 → 后台自动 规划/实现/验收/复核 → 卡在两段人工：`awaiting_review`（agent 复核后先给你初筛）与 `awaiting_approval`（终审批准）→ 你说合或不合。
 
 人只回答一个问题：**要不要合**。其余全部自动重试、自动升级、自动归档。
+
+## 下载安装（macOS）
+
+**[下载 Workbench-0.2.0.zip](https://github.com/noOne-Oliver/workbench/releases/latest)** · 11 MB · macOS 13+ / Apple Silicon · 内核（node + src + web）已在包内，**不需要另装 node**。
+
+1. 解压，把 `Workbench.app` 拖进「应用程序」。
+2. 第一次打开必须**右键 → 打开**（没有苹果公证，双击会被 Gatekeeper 拦住）。也可以：`xattr -dr com.apple.quarantine /Applications/Workbench.app`
+3. 启动后选一个工作区目录（默认 `~/Workbench`）。它会自己建账本、建起始仓库 `demo/`，并在本机起内核 —— 之后提交任务、后台自动跑、到评审时找你。
+
+```
+sha256: 136a4d421787155d4fb313b30e3b2df2f1062a38c1e53aaef5783e1d20c5579f  Workbench-0.2.0.zip
+```
+
+自己构建 / 重新打包：
+
+```bash
+bash apps/macshell/build.sh      # → dist/Workbench.app（swiftc 编外壳 + 拷内核 + ad-hoc 签名）
+bash scripts/package-mac.sh      # → dist/Workbench-<版本>.zip（有 hdiutil 时同时出 .dmg）
+npm run verify:package           # 六断言：离仓可运行 / 工作区正确 / worker 真跑 / SIGTERM 干净 / kill -9 无孤儿 / worker 崩了自愈
+```
 
 ## 30 秒跑起来
 

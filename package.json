@@ -2,7 +2,7 @@
   "name": "workbench",
   "private": true,
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AI 团队分工编程、人只 review 的工作台（v0 内核）",
   "engines": {
     "node": ">=22.5"
@@ -24,6 +24,9 @@
     "demo:real": "node scripts/demo-real-review.mjs --fresh",
     "bench:real": "node scripts/bench-real.mjs --fresh",
     "shot:roles": "node scripts/shot-roles.mjs",
-    "verify:package": "node scripts/verify-package.mjs"
+    "verify:package": "node scripts/verify-package.mjs",
+    "build:mac": "bash apps/macshell/build.sh",
+    "package:mac": "bash scripts/package-mac.sh",
+    "icon:mac": "python3 scripts/make-icon.py"
   }
 }

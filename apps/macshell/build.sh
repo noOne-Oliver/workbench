@@ -134,8 +134,25 @@ cat > "$PLIST" <<'PLIST'
 </dict>
 </plist>
 PLIST
+# 版本只有一个真源（package.json）：否则 app 里显示 0.2.0、/api/health 说 0.1.0，
+# 三处对不上时排查「跑着旧代码」会先被自己骗一轮。
+VERSION="$(node -p "require('$ROOT/package.json').version" 2>/dev/null || echo 0.2.0)"
+BUILD_NO="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 2)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NO" "$PLIST" >/dev/null
+
+# 图标不是必须的，但 Dock 里一个白板图标会让人觉得这是个脚本
+ICON="$HERE/AppIcon.icns"
+if [ -f "$ICON" ]; then
+  cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$PLIST" >/dev/null 2>&1 \
+    || /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$PLIST"
+  echo "    图标: AppIcon.icns"
+fi
+
 plutil -lint "$PLIST" >/dev/null
-echo "    Info.plist OK"
+# 变量后面紧跟全角括号时必须用 ${} 包起来：macOS 自带的老 bash 会把汉字字节吃进变量名里
+echo "    Info.plist OK（版本 ${VERSION} / build ${BUILD_NO}）"
 
 echo "==> 6/6 ad-hoc 签名"
 codesign --force --sign - --timestamp=none "$APP"
