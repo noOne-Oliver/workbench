@@ -3,6 +3,7 @@ worktrees/
 sandbox/
 demo/
 .bench/
+.bench-real/
 .oc/
 *.log
 .DS_Store

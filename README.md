@@ -313,6 +313,42 @@ export function calc(a, b, op) {
 
 ![真引擎跑完的工作区：卡片上有 Verifier 结论、6/6 护栏、按文件分组的 diff](docs/real-review-ui.png)
 
+### 真引擎基准：5 单连跑（2026-11-22）
+
+单跑一单只能证明「跑得通」，说明不了稳定性和成本。这个基准把 5 个独立小任务串起来跑（每个都走完两段评审 + 合并），量的是「日常用起来是什么感受」。
+
+| 任务 | 一次过 | token | 机器耗时 | 改动 | 合并提交 |
+| --- | --- | --- | --- | --- | --- |
+| slugify | ✅ | 412,934 | 115s | 2 files, +31 −1 | `2b13eec` |
+| median | ✅ | 438,804 | 113s | 2 files, +40 −1 | `097ab47` |
+| range-bug | ✅ | 463,427 | 119s | 2 files, +8 | `d0788c2` |
+| clamp | ✅ | 466,648 | 103s | 3 files, +44 | `5799125` |
+| truncate | ✅ | 631,901 | 155s | 3 files, +84 | `6b22bc2` |
+
+**5/5 一次过**（`attempts` 全是 1），总 **2,413,714 token**，平均 **482,743/单**，机器段 103~155 秒（平均 121 秒），5 单总墙钟 **605 秒**。合并后 main 上 `node --test` **33 个用例全绿**（7 → 13 → 14 → 20 → 33，说明每单的测试都真的合进去了）。
+
+token 花在哪（账本 `budget.spent` 按角色聚合）：
+
+| 角色 | token | 占比 |
+| --- | --- | --- |
+| lead（拆解） | 348,924 | 14.5% |
+| architect（切片） | 337,670 | 14.0% |
+| coder（写代码） | 860,737 | 35.7% |
+| verifier（跑测试 + 裁决） | 371,902 | 15.4% |
+| reviewer（合并前复核） | 494,481 | 20.5% |
+
+```bash
+npm run bench:real    # 需要 .oc 里的真凭据；报告写 docs/bench-real-<stamp>.json
+npm run bench:real -- --tasks 2   # mock 也能跑，3 秒验完度量本身
+```
+
+**怎么读这几个数**：
+
+1. **一个小函数的活要 48 万 token，其中 coder 只占 36%**。规划（lead + architect）加评审（reviewer）合计 49%，也就是「每个任务固定 5 次 agent 调用」的编排开销比写代码本身还贵。想省钱该先砍编排（小任务跳过 architect 出 slices、reviewer 复用 verifier 的结论），而不是继续磨 coder 的 prompt。
+2. **成本随仓库变大而涨**：`truncate` 是第 5 单，63 万 token，是第 1 单的 1.5 倍——因为 coder 的上下文里测试文件和既有实现越来越多。这条线再涨下去，单任务预算是会撞墙的。
+3. **5/5 一次过 ≠ 模型稳定**。这 5 个任务都有明确的验收标准、都在一个干净的绿field仓库里，属于「能力范围内」。难度上去（跨文件重构、要读文档、要装依赖）失败率一定上升，那时才轮到重试通道和证据包发挥作用。
+4. **人工耗时这里是脚本代劳的 1 秒下限**（人没真读）。真读过一单的是 4 秒（见上一节）。真正该量的其实是「证据包够不够判断」，这个还没量化——下一步该找一个「模型做对了但人得看很久」的任务来测。
+
 ### 进程管理
 
 ```bash
@@ -457,6 +493,6 @@ src/server/   HTTP + 静态审阅界面
 web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档 + 新建任务表单 + 按文件分组的 diff / 测试清单 / 全屏原始输出）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
-scripts/      Web 版启动器（workbench）、demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）、打包复验（verify-package）
+scripts/      Web 版启动器（workbench）、demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench / bench-real）、打包复验（verify-package）
 apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView；内核打包进 app，离仓可运行）
 ```
