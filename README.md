@@ -77,7 +77,7 @@ npm test                                           # 内核测试（状态机/�
 | --- | --- | --- |
 | `WB_ENGINE` | `mock` | `mock` 假引擎；`opencode` 真引擎（调本机 opencode CLI） |
 | `WB_DB` | `data/ledger.db` | 账本路径 |
-| `WB_TOKEN` | 空 | 设了就要带 `Authorization: Bearer <token>` |
+| `WB_TOKEN` | 空 | 脚本通道：设了就要带 `Authorization: Bearer <token>`（记 `by=cli`），浏览器仍走名字+口令 |
 | `WB_PORT` / `WB_HOST` | `7317` / `127.0.0.1` | 服务监听（多人用时改 `0.0.0.0`） |
 | `WB_MAX_ATTEMPTS` | `3` | 自动重试上限，超过转 `blocked` |
 | `WB_MOCK_DELAY` | `0` | mock 每步延迟，用来模拟慢任务/演示并发 |
@@ -231,18 +231,49 @@ node scripts/workbench.mjs start --port 7317 --workspace ~/Workbench
           首次启动生成，git 里没有；发给同事后自己留一份
 ```
 
-### 口令与身份
+### 一人一号与三种角色
 
-`WB_TOKEN` 是团队共用的**一个**口令（首次启动自动生成到 `<工作区>/.wb/token`，`600` 权限，不进仓库）。登录后发 `HttpOnly; SameSite=Lax` 的 cookie，7 天免密；页面和 API 一起挡住，没登录的人只会看到登录页。
+v0 早期是「一个共享口令」——谁都能批任何事，等于没有身份。现在是**一人一号**：
 
-| 场景 | 怎么带 |
-| --- | --- |
-| 浏览器 | 登录页输口令 → cookie |
-| 脚本 / curl | `-H 'x-wb-token: <口令>'` |
-| 一次性链接 | `?token=<口令>`（发给同事点一下就能进，别贴到群里） |
+| 角色 | 能做什么 | 不能做什么 |
+| --- | --- | --- |
+| member | 提交任务、领取初筛、打回自己领的任务 | 批准合并、改预算、加人 |
+| lead | 上面全部，加终审批准合并、管理成员 | —— |
+| viewer | 只看 | 一切写操作 |
 
-**reviewer 归属**：卡片上的「我是」写的是 `owner`，只有 owner 能裁决（服务端 403 兜住）。多人是共用一个口令，所以谁该看哪张卡靠 owner 字段约定——这是 v0 的取舍，不是忘了做。
+- 口令用 `node:crypto` 的 scrypt 哈希存库（`scrypt$16384$8$1$salt$hash`），不存明文；登录态是 HMAC 签名的 cookie（7 天），**改口令或改角色会立刻踢掉旧会话**（`secret_version`）。
+- 建人：`node src/cli.mjs user add --name alice --role member`（不给 `--password` 就生成一次性口令，只显示一次）；还有 `user passwd / user role / user disable / user enable / user list`。
+- 首次启动一个能登录的账号都没有时，自动建一个 lead 并打印一次性口令——不会卡在「谁都能进」或「谁都进不来」。
+- 历史账本里的 `owner` 会自动补成账号（锁住，等 lead 设口令），不用手工迁移。
 
+`WB_TOKEN` 从「团队共用口令」降级成**脚本 break-glass**（curl/CI 用，记 `by=cli`）；浏览器走名字 + 口令。
+
+### 两段评审（初筛 → 终审）
+
+机器能证明「测试过了」，证明不了「这是不是你要的东西」。所以人这一关拆成两段，而且**两个状态是显式的**——账本重放一眼能看出卡在哪一关：
+
+```text
+implementing → verifying → awaiting_review   （成员初筛）
+             → awaiting_approval              （lead 终审）
+             → merging → done
+```
+
+- **初筛只回答三个问题**（30 秒）：做的是不是这件事 / 范围能不能接受 / 有没有遗留。不重复机器活（测试过没过是 Verifier 的事）。
+- **领取制**：任何 member 都能领，领了锁 30 分钟（`WB_REVIEW_TTL_MS`），超时释放；不用定时任务，读的时候按时间判。
+- **lead 也能直接初筛通过**，账本记 `waived`——小改动不必为流程空转。
+- **自己提交自己批**：允许，但必须写理由，卡片标红、账本记 `self_approved`——统计得出来谁在给自己放水。
+- **打回必须写理由**：原话进 `retryFeedback`，下一轮 coder 的 prompt 里第一句就是它（「优先级高于机器结论」）。
+- 两段耗时分别记 `review_seconds` / `approval_seconds`：初筛打回率长期为 0，就说明这一关该砍。
+
+```bash
+# 端到端演示：alice 提交 → 机器跑 → bob 领取初筛 → lead0 批准 → 合并
+node scripts/demo-review.mjs --fresh
+
+# 界面证据：lead 同时看到「待初筛」和「待批准」两种卡，按钮就是权限矩阵
+node scripts/shot-roles.mjs
+```
+
+![两段评审：lead 看到「待初筛」和「待批准」两种卡，按钮就是权限矩阵](docs/roles-review.png)
 ### 进程管理
 
 ```bash
@@ -272,7 +303,7 @@ npm run web:stop     # SIGTERM，8 秒不退再 SIGKILL
 ### 安全边界（别踩）
 
 - 默认是 **HTTP 明文 + 单口令**：只适合内网/同一 Wi-Fi。要出公网，请套 Tailscale 或 nginx + HTTPS 反代，别直接端口映射。
-- 口令是团队共享的，服务端**不区分人**——审计靠事件里的 `actor`（`human.decision` 记 `by`），不是登录态。
+- 现在一人一号：审计看事件里的 `actor`，`review.claimed` / `review.passed` / `human.decision` 分别记领取人、初筛人、批准人。`WB_TOKEN` 只是脚本通道（记 `by=cli`），别发给人。
 - 工作区里的 `.oc/private/provider.env` 是真模型凭据，别把工作区目录共享出去。
 
 ## 重试闭环（护栏 FAIL → 打回 → 重做 → 通过）

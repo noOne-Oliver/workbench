@@ -16,14 +16,14 @@ export const ROOT = resolve(process.env.WB_ROOT || process.cwd());
 const WORKTREES = resolve(ROOT, "worktrees");
 const SCRATCH = resolve(ROOT, ".oc/scratch");
 const MAX_ATTEMPTS = Number(process.env.WB_MAX_ATTEMPTS || 3);
-const PAUSED = new Set(["awaiting_human", "done", "blocked", "failed"]);
+const PAUSED = new Set(["awaiting_review", "awaiting_approval", "awaiting_human", "done", "blocked", "failed"]);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 可被认领的任务：非暂停态 + 租约空闲或已过期（崩溃恢复走这条路）。 */
 export function pickRunnable(db) {
   return db.prepare(
-    "SELECT id FROM tasks WHERE state NOT IN ('awaiting_human','done','blocked','failed') " +
+    "SELECT id FROM tasks WHERE state NOT IN ('awaiting_review','awaiting_approval','awaiting_human','done','blocked','failed') " +
     "AND (lease_expires_at IS NULL OR lease_expires_at < ?) ORDER BY created_at ASC LIMIT 1"
   ).get(Date.now());
 }
@@ -170,12 +170,28 @@ export function reserveShort(task, ratio) {
   return "预算不足：剩 " + left + "，实现+验证至少还要 " + Math.round(need) + "；加预算或人工接手";
 }
 
-/** 把上一轮验证失败的证据压成一段话，喂给重试的 Coder。没有失败则返回空串。 */
-export function retryFeedback(task) {
+/**
+ * 把「上一轮为什么没过」压成一段话，喂给重试的 Coder。没有失败则返回空串。
+ * 两个来源：机器护栏/Verifier 的证据，和人在初筛/终审打回时写的意见——人的意见优先级更高，
+ * 因为它编码的是「机器判断不了的事」：做的是不是这件事、范围能不能接受。
+ */
+export function retryFeedback(task, db = null) {
   const v = (task && task.evidence && task.evidence.verify) || null;
-  if (!v) return "";
-  const failed = (v.guards || []).filter((c) => !c.ok);
   const lines = [];
+
+  if (db && task && task.id) {
+    const ev = db.prepare("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'review.changes_requested' ORDER BY id DESC LIMIT 1").get(task.id);
+    if (ev) {
+      let p = {};
+      try { p = JSON.parse(ev.payload); } catch { p = {}; }
+      const stage = p.stage === "awaiting_review" ? "初筛" : "终审";
+      lines.push("人（" + (p.by || "?") + "，" + stage + "）把上一版打回了，原话：" + (p.note ? "「" + p.note + "」" : "（没写理由）"));
+      lines.push("这条是人的意见，优先级高于机器结论。不要原样重做——先想清楚他要的是哪个方向的改动，再动手。");
+    }
+  }
+
+  if (!v) return lines.join("\n");
+  const failed = (v.guards || []).filter((c) => !c.ok);
   if (failed.length) {
     lines.push("机器护栏判定失败（这些是确定的，不是建议）：");
     for (const c of failed) lines.push("- " + c.id + "：" + c.detail);
@@ -238,7 +254,7 @@ async function doImplement(db, id, ctx) {
 
   await callAgent(db, id, { ...ctx, cwd: dir }, {
     role: "coder",
-    prompt: sop.coderPrompt(t, t.plan_md || "", attempt, retryFeedback(t)),
+    prompt: sop.coderPrompt(t, t.plan_md || "", attempt, retryFeedback(t, db)),
     attempt,
   });
 
@@ -314,7 +330,8 @@ async function doReview(db, id, ctx) {
   addEvidence(db, id, {
     review: { verdict: v, raised: v.raised || [], diffStat: t.diff_stat, at: new Date().toISOString() },
   }, "review.result");
-  transition(db, id, "awaiting_human", { actor: ctx.workerId, reason: "ready for human" });
+  // 两段评审的第一段：机器 review 之后进「待初筛」，由成员认领；lead 也能直接终审（记 waived）。
+  transition(db, id, "awaiting_review", { actor: ctx.workerId, reason: "ready for first review" });
 }
 
 /** 上一次 attempt.started 之后没有 impl.produced，说明那次尝试没跑完（通常是崩溃）。 */
@@ -331,7 +348,7 @@ async function doMerge(db, id, ctx) {
   const r = sh("git", ["-C", repo, "merge", "--no-ff", "-m", "wb: merge " + t.title, branch]);
   if (!r.ok) {
     addEvidence(db, id, { merge_error: String(r.out).slice(-2000) }, "evidence.patch");
-    transition(db, id, "awaiting_human", { actor: ctx.workerId, reason: "merge conflict, needs human" });
+    transition(db, id, "awaiting_approval", { actor: ctx.workerId, reason: "merge conflict, needs human" });
     return;
   }
   record(db, { taskId: id, type: "merge.done", actor: ctx.workerId, payload: { sha: headSha(repo) } });

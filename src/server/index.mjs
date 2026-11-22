@@ -2,10 +2,15 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import { openDb } from "../core/db.mjs";
-import { createTask, getTask, listTasks, transition, record, addEvidence } from "../core/ledger.mjs";
+import { createTask, getTask, listTasks, transition, record, addEvidence, migrateReviewStates } from "../core/ledger.mjs";
 import { readForTask } from "../core/events.mjs";
 import { feed as readFeed, live as readLive } from "../core/activity.mjs";
 import { watchParent } from "../core/orphan.mjs";
+import { can } from "../core/permissions.mjs";
+import {
+  ROLES, authEnabled, createUser, ensureBootstrapAdmin, ensureLegacyOwners, getUser, listUsers,
+  openSecret, publicUser, sessionUser, setActive, setPassword, setRole, signSession, tempPassword, verifyPassword,
+} from "../core/users.mjs";
 
 // ROOT = 工作区（账本、worktrees、凭据都写这里）；CODE = 内核代码目录（打包后是 app 内的 Resources/kernel）。
 // 两者分开，才能把内核塞进 .app 而数据留在用户自己的工作区。
@@ -15,6 +20,8 @@ const WEB = resolve(CODE, "web");
 const TOKEN = process.env.WB_TOKEN || "";
 const PORT = Number(process.env.WB_PORT || 7317);
 const HOST = process.env.WB_HOST || "127.0.0.1";
+const REVIEW_TTL_MS = Number(process.env.WB_REVIEW_TTL_MS || 30 * 60 * 1000);
+const SESSION_TTL = 7 * 24 * 3600;
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml" };
 
@@ -36,13 +43,6 @@ function cookies(req) {
   return out;
 }
 
-/** 三种带法都认：cookie（浏览器登录后）、x-wb-token（脚本/外壳）、?token=（一次性链接）。 */
-function authed(req) {
-  if (!TOKEN) return true;
-  const given = req.headers["x-wb-token"] || new URL(req.url, "http://x").searchParams.get("token") || cookies(req)[COOKIE] || "";
-  return given === TOKEN;
-}
-
 function setCookie(res, value, maxAge) {
   res.setHeader("set-cookie", COOKIE + "=" + encodeURIComponent(value) + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + maxAge);
 }
@@ -54,27 +54,99 @@ async function readBody(req) {
   try { return JSON.parse(buf); } catch { return {}; }
 }
 
+/** 登录态只有两个来源：签名的 session cookie（人），或 WB_TOKEN（脚本 break-glass，记成 cli/lead）。 */
+function makeCurrentUser(db, secret) {
+  return function currentUser(req) {
+    const u = sessionUser(db, secret, cookies(req)[COOKIE]);
+    if (u) return u;
+    const url = new URL(req.url, "http://x");
+    const given = req.headers["x-wb-token"] || url.searchParams.get("token") || cookies(req)[COOKIE] || "";
+    if (TOKEN && given === TOKEN) return { name: "cli", role: "lead", active: true };
+    return null;
+  };
+}
+
 export function createApp(db) {
+  const SECRET = openSecret(ROOT);
+  const currentUser = makeCurrentUser(db, SECRET);
+
   return async function handler(req, res) {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname;
-
-    // 登录/登出自己不需要先登录（否则永远进不去）
-    if (path === "/api/login" && req.method === "POST") {
-      const b = await readBody(req);
-      if (!TOKEN) return json(res, 200, { ok: true, tokenRequired: false });
-      if (String(b.token || "") !== TOKEN) return json(res, 401, { error: "口令不对" });
-      setCookie(res, TOKEN, 7 * 24 * 3600);
-      return json(res, 200, { ok: true, tokenRequired: true });
-    }
-    if (path === "/api/logout" && req.method === "POST") {
-      setCookie(res, "", 0);
-      return json(res, 200, { ok: true });
-    }
-
-    if (path.startsWith("/api/") && !authed(req)) return json(res, 401, { error: "unauthorized" });
+    const authRequired = authEnabled(db);
+    const me = currentUser(req);
 
     try {
+      // 登录/登出自己不需要先登录（否则永远进不去）
+      if (path === "/api/login" && req.method === "POST") {
+        const b = await readBody(req);
+        // 老式口令登录（脚本/外壳/兼容）：口令对就给 lead 身份的 cookie
+        if (b.token !== undefined) {
+          if (!TOKEN) return json(res, 200, { ok: true, tokenRequired: false });
+          if (String(b.token) !== TOKEN) return json(res, 401, { error: "口令不对" });
+          setCookie(res, TOKEN, SESSION_TTL);
+          return json(res, 200, { ok: true, tokenRequired: true, user: { name: "cli", role: "lead" } });
+        }
+        const u = getUser(db, b.name);
+        if (!u || !u.active || !verifyPassword(b.password, u.password_hash)) {
+          return json(res, 401, { error: "用户名或口令不对" });
+        }
+        setCookie(res, signSession(SECRET, { name: u.name, role: u.role, version: u.secret_version }), SESSION_TTL);
+        return json(res, 200, { ok: true, user: publicUser(u) });
+      }
+      if (path === "/api/logout" && req.method === "POST") {
+        setCookie(res, "", 0);
+        return json(res, 200, { ok: true });
+      }
+
+      if (path.startsWith("/api/") && authRequired && !me) return json(res, 401, { error: "unauthorized" });
+
+      if (req.method === "GET" && path === "/api/me") {
+        return json(res, 200, { user: me, authRequired, roles: ROLES });
+      }
+
+      // ---- 成员管理（只有 lead） ----
+      if (path === "/api/users" && req.method === "GET") {
+        const c = can(me, "manage_users");
+        if (!c.ok) return json(res, 403, { error: c.error });
+        return json(res, 200, { users: listUsers(db).map(publicUser) });
+      }
+      if (path === "/api/users" && req.method === "POST") {
+        const c = can(me, "manage_users");
+        if (!c.ok) return json(res, 403, { error: c.error });
+        const b = await readBody(req);
+        if (!b.name) return json(res, 400, { error: "用户名必填" });
+        try {
+          const pw = b.password ? String(b.password) : null;
+          const u = createUser(db, { name: b.name, role: b.role || "member", password: pw });
+          // 没给口令就生成一个一次性口令，只回这一次（页面负责让人抄走）
+          const oneTime = pw ? null : tempPassword();
+          if (oneTime) setPassword(db, u.name, oneTime);
+          return json(res, 201, { user: publicUser(getUser(db, u.name)), password: oneTime });
+        } catch (e) {
+          return json(res, 400, { error: String(e.message || e) });
+        }
+      }
+      const um = path.match(/^\/api\/users\/([^/]+)$/);
+      if (um && (req.method === "PATCH" || req.method === "POST")) {
+        const c = can(me, "manage_users");
+        if (!c.ok) return json(res, 403, { error: c.error });
+        const b = await readBody(req);
+        const name = decodeURIComponent(um[1]);
+        try {
+          // 重置口令：服务端生成一次性口令回给 lead 转述（页面只显示一次）
+          let oneTime = null;
+          if (b.reset) { oneTime = tempPassword(); setPassword(db, name, oneTime); }
+          else if (b.password) setPassword(db, name, String(b.password));
+          if (b.role) setRole(db, name, String(b.role));
+          if (b.active !== undefined) setActive(db, name, !!b.active);
+          return json(res, 200, { user: publicUser(getUser(db, name)), password: oneTime });
+        } catch (e) {
+          return json(res, 400, { error: String(e.message || e) });
+        }
+      }
+
+      // ---- 任务 ----
       if (req.method === "GET" && path === "/api/tasks") {
         const state = url.searchParams.get("state");
         return json(res, 200, { tasks: listTasks(db, { state: state || null }) });
@@ -101,17 +173,22 @@ export function createApp(db) {
           engine: process.env.WB_ENGINE || "mock",
           ocHome: c.ocHome,
           credentials: { providerEnv: c.providerEnv, providers: c.providers },
-          auth: { tokenRequired: !!TOKEN },
+          auth: { tokenRequired: authRequired, authRequired },
+          me: me,
         });
       }
       if (req.method === "POST" && path === "/api/tasks") {
+        const c = can(me, "create_task");
+        if (!c.ok) return json(res, 403, { error: c.error });
         const b = await readBody(req);
         if (!b.title || !b.repo) return json(res, 400, { error: "title 与 repo 必填" });
+        // 提交人只能是登录的人：身份来自会话，不来自请求体，否则「谁提交的」可以随便写。
         const t = createTask(db, {
-          title: b.title, repo: b.repo, owner: b.owner || "unknown",
+          title: b.title, repo: b.repo, owner: me ? me.name : (b.owner || "unknown"),
           budgetTokens: Number(b.budgetTokens || process.env.WB_BUDGET || 1_000_000),
         });
-        return json(res, 201, { task: t });
+        record(db, { taskId: t.id, type: "task.submitted", actor: me ? me.name : "unknown", payload: { role: me ? me.role : null } });
+        return json(res, 201, { task: getTask(db, t.id) });
       }
       const m = path.match(/^\/api\/tasks\/([^/]+)$/);
       if (req.method === "GET" && m) {
@@ -119,35 +196,89 @@ export function createApp(db) {
         if (!t) return json(res, 404, { error: "not found" });
         return json(res, 200, { task: t, events: readForTask(db, m[1]) });
       }
+
+      // ---- 评审：领取 / 释放 / 初筛通过 / 打回 / 终审批准 ----
+      const rv = path.match(/^\/api\/tasks\/([^/]+)\/review$/);
+      if (req.method === "POST" && rv) {
+        const b = await readBody(req);
+        const action = String(b.action || "");
+        const t = getTask(db, rv[1]);
+        if (!t) return json(res, 404, { error: "not found" });
+        if (!me) return json(res, 401, { error: "未登录" });
+        const PERM = { claim: "claim_review", release: "release_review", pass: "pass_review", request_changes: "request_changes", approve: "approve" };
+        const perm = PERM[action];
+        if (!perm) return json(res, 400, { error: "action 只能是 " + Object.keys(PERM).join(" / ") });
+        const c = can(me, perm, t);
+        if (!c.ok) return json(res, 403, { error: c.error });
+
+        const note = b.note ? String(b.note).trim().slice(0, 4000) : "";
+        const base = { by: me.name, role: me.role, note: note || null };
+
+        if (action === "claim") {
+          record(db, { taskId: t.id, type: "review.claimed", actor: me.name, payload: { ...base, expires_at: Date.now() + REVIEW_TTL_MS } });
+          return json(res, 200, { task: getTask(db, t.id) });
+        }
+        if (action === "release") {
+          record(db, { taskId: t.id, type: "review.released", actor: me.name, payload: { by: me.name, reason: note || null } });
+          return json(res, 200, { task: getTask(db, t.id) });
+        }
+        if (action === "request_changes") {
+          if (!note) return json(res, 400, { error: "打回必须写理由——这是 coder 下一轮唯一的线索" });
+          record(db, { taskId: t.id, type: "review.changes_requested", actor: me.name, payload: { ...base, stage: t.state } });
+          addEvidence(db, t.id, { last_human_note: note }, "evidence.patch");
+          record(db, {
+            taskId: t.id, type: "attempt.reset", actor: me.name,
+            payload: { reason: "human 打回：重试额度归零，上一轮证据留给 coder" },
+          });
+          transition(db, t.id, "queued", { actor: me.name, reason: "human request_changes" });
+          return json(res, 200, { task: getTask(db, t.id) });
+        }
+        if (action === "pass") {
+          record(db, { taskId: t.id, type: "review.passed", actor: me.name, payload: { ...base, waived: !!c.waived } });
+          transition(db, t.id, "awaiting_approval", { actor: me.name, reason: "first review passed" });
+          return json(res, 200, { task: getTask(db, t.id) });
+        }
+        // approve
+        if (c.self_approved && !note) {
+          return json(res, 400, { error: "自己提交的任务自己批，必须写理由（账本会标 self_approved 并统计）" });
+        }
+        record(db, {
+          taskId: t.id, type: "human.decision", actor: me.name,
+          payload: { decision: "approved", note: note || null, by: me.name, role: me.role, self_approved: !!c.self_approved, stage: t.state },
+        });
+        if (note) addEvidence(db, t.id, { last_human_note: note }, "evidence.patch");
+        transition(db, t.id, "merging", { actor: me.name, reason: "approved" });
+        return json(res, 200, { task: getTask(db, t.id) });
+      }
+
+      // 旧接口兼容：approve / reject 映射到 approve / request_changes
       const d = path.match(/^\/api\/tasks\/([^/]+)\/decision$/);
       if (req.method === "POST" && d) {
         const b = await readBody(req);
-        const decision = b.decision;
-        if (!["approve", "reject"].includes(decision)) return json(res, 400, { error: "decision 只能是 approve / reject" });
         const t = getTask(db, d[1]);
         if (!t) return json(res, 404, { error: "not found" });
-        if (t.state !== "awaiting_human") return json(res, 409, { error: "任务当前状态是 " + t.state + "，不在待评审" });
-        if (b.by && t.owner && b.by !== t.owner) return json(res, 403, { error: "只有 owner(" + t.owner + ") 可以裁决" });
-
-        record(db, {
-          taskId: t.id, type: "human.decision", actor: b.by || t.owner,
-          payload: { decision: decision === "approve" ? "approved" : "rejected", note: b.note || null, by: b.by || t.owner },
-        });
-        if (b.note) addEvidence(db, t.id, { last_human_note: b.note }, "evidence.patch");
-        if (decision === "reject") {
-          record(db, {
-            taskId: t.id, type: "attempt.reset", actor: b.by || t.owner,
-            payload: { reason: "human 打回：重试额度归零，上一轮证据留给 coder" },
-          });
+        if (!me) return json(res, 401, { error: "未登录" });
+        const action = b.decision === "approve" ? "approve" : "request_changes";
+        const c = can(me, action === "approve" ? "approve" : "request_changes", t);
+        if (!c.ok) return json(res, 403, { error: c.error });
+        const note = b.note ? String(b.note).trim() : "";
+        if (action === "request_changes" && !note) return json(res, 400, { error: "打回必须写理由" });
+        if (action === "approve" && c.self_approved && !note) return json(res, 400, { error: "自己提交的任务自己批，必须写理由" });
+        if (action === "request_changes") {
+          record(db, { taskId: t.id, type: "review.changes_requested", actor: me.name, payload: { by: me.name, role: me.role, note, stage: t.state } });
+          record(db, { taskId: t.id, type: "attempt.reset", actor: me.name, payload: { reason: "human 打回" } });
+          transition(db, t.id, "queued", { actor: me.name, reason: "human request_changes" });
+        } else {
+          record(db, { taskId: t.id, type: "human.decision", actor: me.name, payload: { decision: "approved", note: note || null, by: me.name, role: me.role, self_approved: !!c.self_approved } });
+          transition(db, t.id, "merging", { actor: me.name, reason: "approved" });
         }
-        transition(db, t.id, decision === "approve" ? "merging" : "queued", { actor: b.by || t.owner, reason: "human " + decision });
         return json(res, 200, { task: getTask(db, t.id) });
       }
 
       if (req.method === "GET") {
         const rel = path === "/" ? "/index.html" : path;
-        // 开了口令时，页面也挡住：没登录的人只能看到登录页（静态资源同理，除了登录页自己）
-        if (TOKEN && !authed(req) && rel !== "/login.html") {
+        // 开了登录时，页面也挡住：没登录的人只能看到登录页（静态资源同理，除了登录页自己）
+        if (authRequired && !me && rel !== "/login.html") {
           res.writeHead(302, { location: "/login.html", "cache-control": "no-store" });
           return res.end();
         }
@@ -169,9 +300,19 @@ export function createApp(db) {
 export function startServer() {
   watchParent({ log: (m) => process.stderr.write("[server] " + m + "\n") });
   const db = openDb();
+  // 老账本自愈：单段待裁决 -> 两段评审；历史 owner 补成账号（锁住，等设口令）
+  const migrated = migrateReviewStates(db);
+  const legacy = ensureLegacyOwners(db);
+  if (migrated) process.stdout.write("[server] 迁移 " + migrated + " 个待裁决任务到两段评审\n");
+  if (legacy.length) process.stdout.write("[server] 历史 owner 已建成账号（未设口令）: " + legacy.join(", ") + "\n");
+  const boot = ensureBootstrapAdmin(db);
+  if (boot) {
+    process.stdout.write("[server] 首次启动，已创建 lead 账号 " + boot.name + "\n");
+    process.stdout.write("[server] 一次性口令: " + boot.password + "  （登录后请立刻改）\n");
+  }
   const server = createServer(createApp(db));
   server.listen(PORT, HOST, () => {
-    process.stdout.write("[server] http://" + HOST + ":" + PORT + (TOKEN ? " (token required)" : "") + "\n");
+    process.stdout.write("[server] http://" + HOST + ":" + PORT + (authEnabled(db) ? " (login required)" : " (open)") + "\n");
   });
   return server;
 }

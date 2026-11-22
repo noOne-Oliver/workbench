@@ -110,11 +110,11 @@ test("登出后立刻失效", async () => {
   assert.match(out.headers.get("set-cookie"), /Max-Age=0/, "要让浏览器把 cookie 删掉");
 });
 
-test("没设 WB_TOKEN 时完全放开（本地单机用）", async () => {
+test("WB_NO_AUTH=1 时完全放开（.app 本机单用户）", async () => {
   const p2 = await freePort();
   const ws2 = mkdtempSync(join(tmpdir(), "wb-auth2-"));
   const s2 = spawn(process.execPath, [join(ROOT, "src/server/index.mjs")], {
-    env: { ...process.env, WB_ROOT: ws2, WB_CODE: ROOT, WB_PORT: String(p2), WB_HOST: "127.0.0.1", WB_TOKEN: "" },
+    env: { ...process.env, WB_ROOT: ws2, WB_CODE: ROOT, WB_PORT: String(p2), WB_HOST: "127.0.0.1", WB_TOKEN: "", WB_NO_AUTH: "1" },
     stdio: ["ignore", "ignore", "ignore"],
   });
   try {
@@ -125,9 +125,45 @@ test("没设 WB_TOKEN 时完全放开（本地单机用）", async () => {
         ok = (await fetch("http://127.0.0.1:" + p2 + "/api/tasks")).status === 200;
       } catch {}
     }
-    assert.ok(ok, "没口令时 API 应该直接 200");
+    assert.ok(ok, "WB_NO_AUTH=1 时 API 应该直接 200");
   } finally {
     s2.kill("SIGKILL");
     rmSync(ws2, { recursive: true, force: true });
+  }
+});
+
+test("首次启动自动建 lead 账号，一次性口令只打印一次，能直接登录", async () => {
+  const p3 = await freePort();
+  const ws3 = mkdtempSync(join(tmpdir(), "wb-auth3-"));
+  const s3 = spawn(process.execPath, [join(ROOT, "src/server/index.mjs")], {
+    env: { ...process.env, WB_ROOT: ws3, WB_CODE: ROOT, WB_PORT: String(p3), WB_HOST: "127.0.0.1", WB_TOKEN: "", WB_ADMIN_NAME: "lead0" },
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  try {
+    let out = "";
+    s3.stdout.on("data", (d) => { out += String(d); });
+    let pw = null;
+    for (let i = 0; i < 60 && !pw; i++) {
+      await sleep(200);
+      const m = out.match(/一次性口令: (\S+)/);
+      if (m) pw = m[1];
+    }
+    assert.ok(pw, "启动日志里必须有一次性口令，否则没人能登录：" + out.slice(0, 400));
+
+    const r = await fetch("http://127.0.0.1:" + p3 + "/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "lead0", password: pw }),
+    });
+    assert.equal(r.status, 200);
+    const cookie = (r.headers.get("set-cookie") || "").split(";")[0];
+    const me = await fetch("http://127.0.0.1:" + p3 + "/api/me", { headers: { cookie } });
+    const j = await me.json();
+    assert.equal(j.user.name, "lead0");
+    assert.equal(j.user.role, "lead");
+    assert.equal(j.user.password_hash, undefined, "不能把口令哈希发到前端");
+  } finally {
+    s3.kill("SIGKILL");
+    rmSync(ws3, { recursive: true, force: true });
   }
 });

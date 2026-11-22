@@ -15,9 +15,11 @@ const api = (p, opts) =>
 const RUNNING = new Set(["queued", "planning", "implementing", "verifying", "reviewing", "merging"]);
 const LABEL = {
   queued: "排队", planning: "拆解中", implementing: "实现中", verifying: "验证中",
-  reviewing: "初审中", awaiting_human: "待裁决", merging: "合并中", done: "已完成",
+  reviewing: "初审中", awaiting_review: "待初筛", awaiting_approval: "待批准",
+  awaiting_human: "待裁决", merging: "合并中", done: "已完成",
   failed: "失败", blocked: "已阻塞",
 };
+const ROLE_LABEL = { lead: "lead（终审）", member: "member（初筛）", viewer: "viewer（只读）" };
 
 const el = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -26,7 +28,11 @@ const secs = (s) => (s == null ? "" : s < 60 ? s + "s" : Math.floor(s / 60) + "m
 const hhmmss = (ts) => { try { return new Date(ts).toLocaleTimeString("zh-CN", { hour12: false }); } catch { return ""; } };
 
 let tasks = [];
-let ME = localStorage.getItem("wb_me") || "liujie";
+// 身份来自服务端会话（/api/workspace 的 me），不再让人自己填字符串——能绕过 UI 的才叫身份。
+let ME = "";
+let ROLE = "viewer";
+const isLead = () => ROLE === "lead";
+const isViewer = () => ROLE === "viewer";
 let feed = [];          // 最近的活动事件（升序）
 let live = [];          // 每个在跑的任务此刻在做什么
 let cursor = 0;         // 增量拉取的游标（事件 id）
@@ -57,7 +63,12 @@ function describe(e) {
     case "agent.finished": return ["完成", p.role + " · " + fmt(p.tokens) + " tok · " + (p.ms >= 1000 ? Math.round(p.ms / 1000) + "s" : p.ms + "ms") + (p.ok ? "" : " · 失败")];
     case "budget.spent": return ["预算", "+" + fmt(p.tokens) + " tok" + (p.detail && p.detail.role ? " · " + p.detail.role : "")];
     case "run.error": return ["错误", p.error || ""];
-    case "human.decision": return ["人", p.decision + (p.note ? "：" + p.note : "")];
+    case "human.decision": return ["终审", p.decision + (p.self_approved ? "（自己批的，已标红）" : "") + (p.note ? "：" + p.note : "")];
+    case "task.submitted": return ["提交", "身份 " + (p.role || "?")];
+    case "review.claimed": return ["领取初筛", p.by + " · 30 分钟内有效"];
+    case "review.released": return ["释放初筛", p.by || ""];
+    case "review.passed": return ["初筛通过", p.by + (p.waived ? "（lead 直接终审，记 waived）" : "") + (p.note ? "：" + p.note : "")];
+    case "review.changes_requested": return ["打回", p.by + "（" + (p.stage === "awaiting_review" ? "初筛" : "终审") + "）" + (p.note ? "：" + p.note : "")];
     case "merge.done": return ["合并", String(p.sha || "").slice(0, 7)];
     case "lease.acquired": return ["租约", "被 " + (p.owner || "?") + " 认领"];
     case "lease.released": return ["租约", "释放"];
@@ -203,6 +214,56 @@ function liveLine(t) {
   return "";
 }
 
+/** 谁在哪个环节：这两行决定「以为别人在看」不会发生。 */
+function reviewBlock(t) {
+  const rows = [];
+  rows.push('<div class="row"><span>提交人: <b>' + esc(t.owner) + "</b></span>" +
+    (t.first_reviewed_by ? "<span>初筛: " + esc(t.first_reviewed_by) + "</span>" : "") +
+    (t.approved_by ? "<span>批准: " + esc(t.approved_by) + (t.self_approved ? " ⚠ self" : "") + "</span>" : "") +
+    (t.review_seconds != null ? "<span>初筛用了 " + t.review_seconds + "s</span>" : "") +
+    (t.approval_seconds != null ? "<span>终审用了 " + t.approval_seconds + "s</span>" : "") +
+    "</div>");
+  if (t.state === "awaiting_review" && t.reviewer) {
+    const left = Math.max(0, Math.round((Number(t.review_lease_expires_at || 0) - Date.now()) / 60000));
+    rows.push(left > 0
+      ? '<div class="row">初筛领取人: <b>' + esc(t.reviewer) + "</b> · 锁 " + left + " 分钟</div>"
+      : '<div class="row" style="color:var(--warn)">' + esc(t.reviewer) + " 的领取已超时，可以接手</div>");
+  }
+  if (t.owner === ME) {
+    rows.push('<div class="row" style="color:var(--warn)">这是你自己提交的任务：终审必须别的 lead 批；自己批要写理由，账本标 self_approved 并进统计。</div>');
+  }
+  return rows.join("");
+}
+
+function reviewActions(t) {
+  if (isViewer()) return '<div class="row hint">只读账号：可以看，不能裁决</div>';
+  const btn = (action, cls, label) => '<button class="' + cls + '" onclick="reviewAction(\'' + t.id + '\',\'' + action + '\')">' + label + "</button>";
+  const timeline = '<button class="ghost" onclick="watch(\'' + t.id + '\')">看时间线</button>';
+
+  if (t.state === "awaiting_review") {
+    const expired = t.reviewer && Number(t.review_lease_expires_at || 0) < Date.now();
+    const canClaim = !t.reviewer || expired;
+    const mine = t.reviewer === ME;
+    const out = [];
+    if (canClaim) out.push(btn("claim", "ghost", "领取初筛（锁 30 分钟）"));
+    if (mine) out.push(btn("pass", "primary", "初筛通过 → 交给 lead 终审"));
+    else if (isLead()) out.push(btn("pass", "primary", "lead 直接初筛通过（记 waived）"));
+    out.push(btn("request_changes", "danger", "打回重做"));
+    return '<textarea id="note-' + t.id + '" placeholder="打回必须写理由——这是 coder 下一轮唯一的线索"></textarea>' +
+      '<div class="actions">' + out.join("") + timeline + "</div>";
+  }
+  if (t.state === "awaiting_approval" || t.state === "awaiting_human") {
+    if (!isLead()) return '<div class="row hint">已初筛通过，等 lead 终审（member 的权限到初筛为止）</div>' +
+      '<div class="actions">' + timeline + "</div>";
+    const self = t.owner === ME;
+    return '<textarea id="note-' + t.id + '" placeholder="' + (self ? "自己提交自己批，必须写理由" : "批注（可选）") + '"></textarea>' +
+      '<div class="actions">' +
+      btn("approve", "primary", self ? "自己批准并合并（标红 + 统计）" : "批准并合并") +
+      btn("request_changes", "danger", "打回重做") + timeline + "</div>";
+  }
+  return "";
+}
+
 function card(t, actionable) {
   const ev = t.evidence || {};
   const v = ev.verify || {};
@@ -210,13 +271,13 @@ function card(t, actionable) {
   const checks = (v.guards || []).map((c) =>
     '<li class="' + (c.ok ? "yes" : "no") + '">' + (c.ok ? "✓ " : "✗ ") + esc(c.id) + " — " + esc(c.detail) + "</li>").join("");
   const raised = (rv.raised || []).map((x) => "<li>" + esc(x) + "</li>").join("");
-  return '<div class="card ' + (actionable ? "awaiting" : "") + '">' +
+  return '<div class="card ' + (actionable ? "awaiting" : "") + (t.self_approved ? " self" : "") + '">' +
     "<h3>" + esc(t.title) + "</h3>" +
     '<div class="row"><span class="badge">' + (LABEL[t.state] || t.state) + "</span>" +
-      "<span>owner: " + esc(t.owner) + "</span>" +
+      "<span>提交 " + esc(t.owner) + "</span>" +
       "<span>尝试 " + t.attempts + "</span>" +
       "<span>预算 " + fmt(t.spent_tokens) + "/" + fmt(t.budget_tokens) + "</span>" +
-      (t.review_seconds != null ? "<span>上轮评审 " + t.review_seconds + "s</span>" : "") +
+      (t.review_seconds != null ? "<span>初筛 " + t.review_seconds + "s</span>" : "") +
     "</div>" +
     liveLine(t) +
     (t.diff_stat ? '<div class="row mono">' + esc(t.diff_stat) + "</div>" : "") +
@@ -226,24 +287,22 @@ function card(t, actionable) {
     (v.diff ? diffSection(v.diff) : "") +
     testSection(v, t.id) +
     (ev.last_error ? '<div class="row" style="color:var(--bad)">最近错误: ' + esc(ev.last_error) + "</div>" : "") +
-    (actionable && t.owner && ME !== t.owner ?
-      '<div class="row" style="color:var(--warn)">这个任务归 ' + esc(t.owner) + " 裁决，当前身份是 " + esc(ME) + "（右上角可改）</div>" : "") +
-    (actionable ?
-      '<textarea id="note-' + t.id + '" placeholder="批注（reject 时建议写清哪里不对）"></textarea>' +
-      '<div class="actions">' +
-      '<button class="primary" onclick="decide(\'' + t.id + '\',\'approve\')">通过并合并</button>' +
-      '<button class="danger" onclick="decide(\'' + t.id + '\',\'reject\')">打回重做</button>' +
-      '<button class="ghost" onclick="watch(\'' + t.id + '\')">看时间线</button>' +
-      "</div>" : "") +
+    reviewBlock(t) +
+    (actionable ? reviewActions(t) : "") +
+    (actionable ? "" : "") +
     "</div>";
 }
 
+const AWAITING = new Set(["awaiting_review", "awaiting_approval", "awaiting_human"]);
+
 function render() {
-  const awaiting = tasks.filter((t) => t.state === "awaiting_human");
+  // 初筛在前、终审在后：先来先看，别让一条终审把初筛队列挡住。
+  const awaiting = tasks.filter((t) => AWAITING.has(t.state))
+    .sort((a, b) => (a.state === "awaiting_review" ? 0 : 1) - (b.state === "awaiting_review" ? 0 : 1));
   const running = tasks.filter((t) => RUNNING.has(t.state));
   const done = tasks.filter((t) => ["done", "failed", "blocked"].includes(t.state));
 
-  el("awaiting").innerHTML = awaiting.length ? awaiting.map((t) => card(t, true)).join("") : '<div class="empty">没有待裁决的任务</div>';
+  el("awaiting").innerHTML = awaiting.length ? awaiting.map((t) => card(t, true)).join("") : '<div class="empty">没有待处理的任务</div>';
   el("running").innerHTML = running.length ? running.map((t) => card(t, false)).join("") : '<div class="empty">后台空闲</div>';
   el("done").innerHTML = done.length ? done.slice(0, 20).map((t) => card(t, false)).join("") : '<div class="empty">暂无归档</div>';
 
@@ -317,27 +376,21 @@ window.logout = async function () {
 window.toggleCtx = toggleCtx;
 window.openRaw = openRaw;
 
-window.decide = async function (id, decision) {
-  const note = (document.getElementById("note-" + id) || {}).value || "";
-  const r = await api("/api/tasks/" + id + "/decision", {
+// 评审动作只有一个入口：服务端按角色判权限，前端只负责别显示不该点的按钮。
+window.reviewAction = async function (id, action) {
+  const note = ((document.getElementById("note-" + id) || {}).value || "").trim();
+  if (action === "request_changes" && !note) { alert("打回必须写理由——这是 coder 下一轮唯一的线索"); return; }
+  const t = tasks.find((x) => x.id === id);
+  if (action === "approve" && t && t.owner === ME && !note) { alert("自己提交的任务自己批，必须写理由"); return; }
+  const r = await api("/api/tasks/" + id + "/review", {
     method: "POST",
-    body: JSON.stringify({ decision, note, by: ME }),
+    body: JSON.stringify({ action, note }),
   });
   const j = await r.json();
-  if (!r.ok) alert(j.error || "操作失败");
+  if (!r.ok) { alert(j.error || "操作失败"); return; }
   await load();
   await loadFeed();
 };
-
-const meInput = el("me");
-if (meInput) {
-  meInput.value = ME;
-  meInput.addEventListener("change", () => {
-    ME = meInput.value.trim() || "liujie";
-    localStorage.setItem("wb_me", ME);
-    load();
-  });
-}
 
 // 新建任务：打包后的 app 没有终端，这里是唯一入口。
 async function loadWorkspace() {
@@ -352,11 +405,81 @@ async function loadWorkspace() {
     }
     const repo = el("t-repo");
     if (repo && !repo.value) repo.value = w.starterRepo;
-    // 开了口令才显示「退出」——本地单机用的时候不需要多一个按钮
+
+    // 身份以服务端为准：右上角显示「谁 + 什么角色」，按钮由角色决定。
+    if (w.me) { ME = w.me.name || ""; ROLE = w.me.role || "viewer"; }
+    const who = el("who");
+    if (who) who.innerHTML = esc(ME || "未登录") + ' <span class="badge">' + esc(ROLE_LABEL[ROLE] || ROLE) + "</span>";
     const logout = el("logout");
-    if (logout && w.auth && w.auth.tokenRequired) logout.hidden = false;
+    if (logout && w.auth && w.auth.authRequired) logout.hidden = false;
+    const teamBtn = el("team-btn");
+    if (teamBtn) teamBtn.hidden = !isLead();
+    const compose = el("compose");
+    if (compose) compose.hidden = isViewer();
   } catch { /* 老内核没有这个接口，忽略 */ }
 }
+
+// ---- 成员管理（只有 lead 看得见；服务端仍会 403） ----
+async function fetchUsers() {
+  const r = await api("/api/users");
+  if (!r.ok) return [];
+  return (await r.json()).users || [];
+}
+
+function teamRow(u) {
+  return "<tr><td>" + esc(u.name) + "</td><td>" + esc(ROLE_LABEL[u.role] || u.role) + "</td><td>" +
+    (u.active ? (u.hasPassword ? "可登录" : "未设口令") : "已停用") + "</td><td>" +
+    '<button class="ghost" onclick="resetPassword(\'' + esc(u.name) + '\')">重置口令</button>' +
+    '<button class="ghost" onclick="toggleUser(\'' + esc(u.name) + '\',' + (u.active ? "false" : "true") + ')">' +
+    (u.active ? "停用" : "启用") + "</button></td></tr>";
+}
+
+window.openTeam = async function () {
+  const dlg = el("team");
+  const box = el("team-body");
+  if (!dlg.open) dlg.showModal();
+  box.innerHTML = '<div class="hint">加载中…</div>';
+  const users = await fetchUsers();
+  box.innerHTML = '<table class="users"><thead><tr><th>名字</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+    users.map(teamRow).join("") + "</tbody></table>" +
+    '<form id="add-user" class="adduser" autocomplete="off">' +
+    '<input id="u-name" placeholder="名字" size="12" required />' +
+    '<select id="u-role"><option value="member">member</option><option value="lead">lead</option><option value="viewer">viewer</option></select>' +
+    '<button class="primary" type="submit">加人（生成一次性口令）</button></form>' +
+    '<div id="team-msg" class="mono"></div>';
+  el("add-user").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const r = await api("/api/users", { method: "POST", body: JSON.stringify({ name: el("u-name").value.trim(), role: el("u-role").value }) });
+    const j = await r.json();
+    if (!r.ok) { el("team-msg").textContent = j.error || "失败"; return; }
+    el("team-msg").textContent = "已创建 " + j.user.name + "（" + j.user.role + "）一次性口令：" + (j.password || "（无）") + " —— 只显示这一次";
+    el("u-name").value = "";
+    await refreshTeam();
+  });
+};
+
+async function refreshTeam() {
+  const users = await fetchUsers();
+  const tbody = document.querySelector("#team-body tbody");
+  if (tbody) tbody.innerHTML = users.map(teamRow).join("");
+}
+
+window.resetPassword = async function (name) {
+  if (!confirm("给 " + name + " 重置口令？旧登录会立刻失效。")) return;
+  const r = await api("/api/users/" + encodeURIComponent(name), { method: "PATCH", body: JSON.stringify({ reset: true }) });
+  const j = await r.json();
+  if (!r.ok) { alert(j.error || "失败"); return; }
+  const msg = el("team-msg");
+  if (msg) msg.textContent = name + " 的新一次性口令：" + (j.password || "（无）") + " —— 只显示这一次";
+  await refreshTeam();
+};
+
+window.toggleUser = async function (name, active) {
+  const r = await api("/api/users/" + encodeURIComponent(name), { method: "PATCH", body: JSON.stringify({ active }) });
+  const j = await r.json();
+  if (!r.ok) { alert(j.error || "失败"); return; }
+  await refreshTeam();
+};
 
 const composeForm = el("new-task");
 if (composeForm) {

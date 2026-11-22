@@ -103,4 +103,20 @@ dialog#raw-viewer { width: 92vw; height: 88vh; max-width: none; padding: 0; back
 dialog#raw-viewer::backdrop { background: rgba(0,0,0,.62); }
 .rv-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12px; }
 dialog#raw-viewer pre { max-height: none; height: calc(88vh - 46px); margin: 0; border: 0; border-radius: 0; }
+/* ---- 角色：自己提交自己批的卡片标红，统计看得见 ---- */
+.card.self { border-color: #7a2b26; box-shadow: 0 0 0 1px rgba(248,81,73,.18) inset; }
+.meta .badge { text-transform: none; letter-spacing: 0; }
+
+/* ---- 成员管理弹窗 ---- */
+dialog#team { width: min(720px, 92vw); max-height: 84vh; padding: 0; background: #0d1218; color: var(--fg); border: 1px solid var(--line); border-radius: 10px; }
+dialog#team::backdrop { background: rgba(0,0,0,.6); }
+dialog#team #team-body { padding: 12px; }
+table.users { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.users th { text-align: left; color: var(--dim); font-weight: 500; border-bottom: 1px solid var(--line); padding: 6px 4px; }
+table.users td { padding: 6px 4px; border-bottom: 1px solid #151b23; }
+table.users td button { margin-right: 6px; }
+form.adduser { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
+form.adduser input, form.adduser select { background: #0b0f14; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+#team-msg { color: var(--ok); margin-top: 10px; white-space: pre-wrap; }
+
 

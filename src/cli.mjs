@@ -82,12 +82,50 @@ async function main() {
     process.stdout.write(JSON.stringify(credentialStatus(root)) + "\n");
     return;
   }
+  if (cmd === "user") {
+    const u = await import("./core/users.mjs");
+    const sub = process.argv[3] || "list";
+    if (sub === "add") {
+      const name = arg("name");
+      const role = arg("role", "member");
+      const pw = arg("password");
+      if (!name) { process.stdout.write("用法: cli.mjs user add --name <名字> [--role lead|member|viewer] [--password <口令>]\n"); process.exit(2); }
+      const oneTime = pw ? null : u.tempPassword();
+      u.createUser(db, { name, role, password: pw || oneTime });
+      process.stdout.write("已创建 " + name + " (" + role + ")\n");
+      if (oneTime) process.stdout.write("一次性口令: " + oneTime + "\n");
+      return;
+    }
+    if (sub === "passwd") {
+      const name = arg("name");
+      const pw = arg("password");
+      if (!name) { process.stdout.write("用法: cli.mjs user passwd --name <名字> [--password <口令>]\n"); process.exit(2); }
+      const oneTime = pw || u.tempPassword();
+      u.setPassword(db, name, oneTime);
+      process.stdout.write("已重置 " + name + " 的口令: " + oneTime + "\n（旧登录全部失效）\n");
+      return;
+    }
+    if (sub === "role") {
+      u.setRole(db, arg("name"), arg("role"));
+      process.stdout.write("已改角色: " + arg("name") + " -> " + arg("role") + "\n");
+      return;
+    }
+    if (sub === "disable" || sub === "enable") {
+      u.setActive(db, arg("name"), sub === "enable");
+      process.stdout.write("已" + (sub === "enable" ? "启用" : "停用") + ": " + arg("name") + "\n");
+      return;
+    }
+    for (const x of u.listUsers(db)) {
+      process.stdout.write([x.name.padEnd(12), x.role.padEnd(7), x.active ? "active" : "locked", x.password_hash ? "" : "(未设口令)"].join("  ") + "\n");
+    }
+    return;
+  }
   if (cmd === "serve") {
     const { startServer } = await import("./server/index.mjs");
     startServer();
     return;
   }
-  process.stdout.write("用法: cli.mjs <init|workspace|cred|enqueue|status|rebuild|run|serve>\n");
+  process.stdout.write("用法: cli.mjs <init|workspace|cred|user|enqueue|status|rebuild|run|serve>\n");
 }
 
 main().catch((e) => { process.stderr.write(String(e && e.stack || e) + "\n"); process.exit(1); });

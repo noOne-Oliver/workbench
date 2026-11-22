@@ -5,23 +5,37 @@ import { newId } from "./ids.mjs";
  * 状态机。所有迁移必须在这里声明，未声明的迁移一律拒绝——这是"账本先于执行器"的落点。
  */
 export const STATES = [
-  "queued", "planning", "implementing", "verifying",
-  "reviewing", "awaiting_human", "merging", "done",
-  "failed", "blocked",
+  "queued", "planning", "implementing", "verifying", "reviewing",
+  "awaiting_review",    // 成员初筛（做的是不是这件事）
+  "awaiting_approval",  // lead 终审（要不要合）
+  "awaiting_human",     // 旧账本兼容：两段评审之前的单段状态
+  "merging", "done", "failed", "blocked",
 ];
 
+/** 两段评审：机器 review 之后进初筛，初筛通过进终审，任一段都能打回 queued。 */
 export const TRANSITIONS = {
-  queued:          ["planning", "blocked", "failed"],
-  planning:        ["implementing", "queued", "blocked", "failed"],
-  implementing:    ["verifying", "queued", "blocked", "failed"],
-  verifying:       ["reviewing", "implementing", "blocked", "failed"],
-  reviewing:       ["awaiting_human", "implementing", "blocked", "failed"],
-  awaiting_human:  ["merging", "queued", "failed"],           // approve / changes_requested
-  merging:         ["done", "awaiting_human", "failed"],
-  done:            [],
-  failed:          ["queued"],
-  blocked:         ["queued"],
+  queued:            ["planning", "blocked", "failed"],
+  planning:          ["implementing", "queued", "blocked", "failed"],
+  implementing:      ["verifying", "queued", "blocked", "failed"],
+  verifying:         ["reviewing", "implementing", "blocked", "failed"],
+  reviewing:         ["awaiting_review", "implementing", "blocked", "failed"],
+  awaiting_review:   ["awaiting_approval", "queued", "blocked", "failed"],
+  awaiting_approval: ["merging", "queued", "failed"],
+  awaiting_human:    ["awaiting_approval", "merging", "queued", "failed"],
+  merging:           ["done", "awaiting_approval", "failed"],
+  done:              [],
+  failed:            ["queued"],
+  blocked:           ["queued"],
 };
+
+/** 老账本迁移：单段 awaiting_human 视作「已初筛、等 lead 终审」。幂等。 */
+export function migrateReviewStates(db) {
+  const rows = db.prepare("SELECT id, owner FROM tasks WHERE state = 'awaiting_human'").all();
+  for (const r of rows) {
+    transition(db, r.id, "awaiting_approval", { actor: "migration", reason: "两段评审：单段待裁决迁到待批准" });
+  }
+  return rows.length;
+}
 
 const TERMINAL = new Set(["done"]);
 
@@ -122,22 +136,54 @@ export function applyEvent(db, ev) {
       break;
     }
     case "task.transition": {
-      const t = db.prepare("SELECT state, review_started_at FROM tasks WHERE id = ?").get(ev.task_id);
+      const t = db.prepare("SELECT state, review_started_at, approval_started_at FROM tasks WHERE id = ?").get(ev.task_id);
       if (!t) break;
       const nowMs = Date.parse(ev.ts);
       let reviewStarted = t.review_started_at ?? null;
       let reviewSeconds = null;
-      if (p.to === "awaiting_human") reviewStarted = nowMs;
-      if (t.state === "awaiting_human" && p.to !== "awaiting_human" && reviewStarted) {
+      let approvalStarted = t.approval_started_at ?? null;
+      let approvalSeconds = null;
+
+      // 初筛一段：进 awaiting_review 开始计时，离开时结算。旧单段状态同样计时，历史数据才有意义。
+      if (p.to === "awaiting_review" || p.to === "awaiting_human") reviewStarted = nowMs;
+      if ((t.state === "awaiting_review" || t.state === "awaiting_human") &&
+          p.to !== "awaiting_review" && p.to !== "awaiting_human" && reviewStarted) {
         reviewSeconds = Math.max(0, Math.round((nowMs - reviewStarted) / 1000));
         reviewStarted = null;
       }
+      // 终审一段
+      if (p.to === "awaiting_approval") approvalStarted = nowMs;
+      if (t.state === "awaiting_approval" && p.to !== "awaiting_approval" && approvalStarted) {
+        approvalSeconds = Math.max(0, Math.round((nowMs - approvalStarted) / 1000));
+        approvalStarted = null;
+      }
+
       db.prepare(`UPDATE tasks SET state=?, updated_at=?,
         review_started_at = COALESCE(?, review_started_at),
-        review_seconds = COALESCE(?, review_seconds) WHERE id=?`)
-        .run(p.to, ev.ts, reviewStarted, reviewSeconds, ev.task_id);
+        review_seconds = COALESCE(?, review_seconds),
+        approval_started_at = COALESCE(?, approval_started_at),
+        approval_seconds = COALESCE(?, approval_seconds) WHERE id=?`)
+        .run(p.to, ev.ts, reviewStarted, reviewSeconds, approvalStarted, approvalSeconds, ev.task_id);
       break;
     }
+    // 初筛领取：锁定 30 分钟，超时自动可被别人领（不需要定时任务，读的时候按时间判）。
+    case "review.claimed":
+      db.prepare("UPDATE tasks SET reviewer=?, review_lease_expires_at=?, updated_at=? WHERE id=?")
+        .run(p.by, p.expires_at, ev.ts, ev.task_id);
+      break;
+    case "review.released":
+      db.prepare("UPDATE tasks SET reviewer=NULL, review_lease_expires_at=NULL, updated_at=? WHERE id=?")
+        .run(ev.ts, ev.task_id);
+      break;
+    case "review.passed":
+      db.prepare(`UPDATE tasks SET reviewer=NULL, review_lease_expires_at=NULL,
+        first_reviewed_by=?, first_reviewed_at=?, updated_at=? WHERE id=?`)
+        .run(p.by, ev.ts, ev.ts, ev.task_id);
+      break;
+    case "review.changes_requested":
+      db.prepare("UPDATE tasks SET reviewer=NULL, review_lease_expires_at=NULL, decision='rejected', decision_note=?, updated_at=? WHERE id=?")
+        .run(p.note ?? null, ev.ts, ev.task_id);
+      break;
     case "lease.acquired":
       db.prepare("UPDATE tasks SET lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=?")
         .run(p.owner, p.expires_at, ev.ts, ev.task_id);
@@ -174,8 +220,16 @@ export function applyEvent(db, ev) {
       db.prepare("UPDATE tasks SET attempts = 0, updated_at=? WHERE id=?").run(ev.ts, ev.task_id);
       break;
     case "human.decision":
-      db.prepare("UPDATE tasks SET decision=?, decision_note=?, updated_at=? WHERE id=?")
-        .run(p.decision, p.note ?? null, ev.ts, ev.task_id);
+      db.prepare(`UPDATE tasks SET decision=?, decision_note=?,
+        approved_by = CASE WHEN ? = 'approved' THEN ? ELSE approved_by END,
+        approved_at = CASE WHEN ? = 'approved' THEN ? ELSE approved_at END,
+        self_approved = CASE WHEN ? = 1 THEN 1 ELSE self_approved END,
+        updated_at=? WHERE id=?`)
+        .run(p.decision, p.note ?? null,
+             p.decision, p.by ?? null,
+             p.decision, ev.ts,
+             p.self_approved ? 1 : 0,
+             ev.ts, ev.task_id);
       break;
     default:
       break;

@@ -3,7 +3,8 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 export const ROOT = resolve(process.cwd());
-export const DB_PATH = resolve(process.env.WB_DB ?? resolve(ROOT, "data/ledger.db"));
+// 账本跟着工作区走：设了 WB_ROOT 就是 <工作区>/data/ledger.db，否则是当前目录。
+export const DB_PATH = resolve(process.env.WB_DB ?? resolve(process.env.WB_ROOT || ROOT, "data/ledger.db"));
 
 /**
  * 打开账本。
@@ -56,5 +57,31 @@ function migrate(db) {
       updated_at      TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, created_at);
+
+    CREATE TABLE IF NOT EXISTS users (
+      name            TEXT PRIMARY KEY,
+      role            TEXT NOT NULL DEFAULT 'member',
+      password_hash   TEXT,
+      secret_version  INTEGER NOT NULL DEFAULT 1,
+      active          INTEGER NOT NULL DEFAULT 1,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL
+    );
   `);
+
+  // 两段评审（初筛 / 终审）新增的列。老库直接 ALTER，新库在这里补齐。
+  addColumn(db, "tasks", "reviewer", "TEXT");
+  addColumn(db, "tasks", "review_lease_expires_at", "INTEGER");
+  addColumn(db, "tasks", "first_reviewed_by", "TEXT");
+  addColumn(db, "tasks", "first_reviewed_at", "TEXT");
+  addColumn(db, "tasks", "approval_started_at", "INTEGER");
+  addColumn(db, "tasks", "approval_seconds", "INTEGER");
+  addColumn(db, "tasks", "approved_by", "TEXT");
+  addColumn(db, "tasks", "approved_at", "TEXT");
+  addColumn(db, "tasks", "self_approved", "INTEGER NOT NULL DEFAULT 0");
+}
+
+function addColumn(db, table, column, type) {
+  const cols = db.prepare("PRAGMA table_info(" + table + ")").all().map((c) => c.name);
+  if (!cols.includes(column)) db.exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + type);
 }

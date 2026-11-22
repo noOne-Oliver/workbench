@@ -10,14 +10,15 @@
   <header>
     <h1>评审收件箱</h1>
     <div class="meta">
-      <label class="me">我是 <input id="me" size="10" spellcheck="false" /></label>
+      <span id="who" class="me">…</span>
+      <button id="team-btn" class="ghost" hidden onclick="openTeam()">成员</button>
       <button id="logout" class="ghost" hidden onclick="logout()" title="清掉登录 cookie">退出</button>
       <span id="clock"></span>
     </div>
   </header>
   <section id="compose">
     <details id="compose-box">
-      <summary>＋ 新建任务（后台自动开跑，只在待裁决时找你）</summary>
+      <summary>＋ 新建任务（后台自动开跑，只在需要你 review 时找你）</summary>
       <form id="new-task" autocomplete="off">
         <input id="t-title" placeholder="要 agent 做什么（一句话）" size="42" required />
         <input id="t-repo" placeholder="目标仓库路径" size="36" required />
@@ -30,7 +31,9 @@
   </section>
   <main>
     <section id="queue" class="col">
-      <h2>待我裁决 <span id="n-await" class="pill">0</span></h2>
+      <h2>待处理 <span id="n-await" class="pill">0</span>
+        <span class="hint">初筛 30 秒 · 终审只回答「要不要合」</span>
+      </h2>
       <div id="awaiting" class="cards"></div>
     </section>
     <section id="inflight" class="col">
@@ -52,6 +55,10 @@
   <dialog id="raw-viewer">
     <div class="rv-head"><b id="rv-title"></b><button class="ghost" onclick="document.getElementById('raw-viewer').close()">关闭</button></div>
     <pre id="rv-body"></pre>
+  </dialog>
+  <dialog id="team">
+    <div class="rv-head"><b>团队成员</b><button class="ghost" onclick="document.getElementById('team').close()">关闭</button></div>
+    <div id="team-body"></div>
   </dialog>
   <script type="module" src="/app.js"></script>
 </body>
