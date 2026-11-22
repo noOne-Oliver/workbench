@@ -7,7 +7,7 @@
 
 ## 下载安装（macOS）
 
-**[下载 Workbench-0.2.0.zip](https://github.com/noOne-Oliver/workbench/releases/latest)** · 11 MB · macOS 13+ / Apple Silicon · 内核（node + src + web）已在包内，**不需要另装 node**。
+**[下载 Workbench-0.2.0.zip](../../releases/latest)** · 11 MB · macOS 13+ / Apple Silicon · 内核（node + src + web）已在包内，**不需要另装 node**。
 
 1. 解压，把 `Workbench.app` 拖进「应用程序」。
 2. 第一次打开必须**右键 → 打开**（没有苹果公证，双击会被 Gatekeeper 拦住）。也可以：`xattr -dr com.apple.quarantine /Applications/Workbench.app`
