@@ -54,6 +54,11 @@ export async function runTask(db, id, ctx) {
       addEvidence(db, id, { last_error: msg, at: new Date().toISOString() }, "evidence.patch");
       record(db, { taskId: id, type: "run.error", actor: workerId, payload: { state: cur && cur.state, error: msg.slice(0, 400) } }, false);
       if (cur && cur.state === "blocked") return cur; // 熔断后的状态不许被 catch 重新拉回队列
+      // 确定性失败（权限/凭据/模型不存在）：重试是纯烧钱，直接交给人。
+      if (e && e.fatal) {
+        transition(db, id, "blocked", { actor: workerId, reason: msg.slice(0, 300) });
+        return getTask(db, id);
+      }
       // 计划和验证阶段的失败不会涨 attempts（没走到 implementing），
       // 只看 attempts 会让"每次调用都失败的引擎"无限重试、白烧时间。所以单独数错误。
       const errors = db.prepare("SELECT COUNT(*) AS n FROM events WHERE task_id=? AND type='run.error'").get(id).n;
@@ -80,7 +85,12 @@ async function callAgent(db, id, ctx, { role, prompt, attempt }) {
     const zeroBased = attempt === undefined ? Math.max(0, t.attempts - 1) : attempt;
     const res = await ctx.provider.run({ role, prompt, cwd: ctx.cwd, task: t, attempt: zeroBased });
     if (res && res.tokens) spendBudget(db, id, res.tokens, { role });
-    if (!res || !res.ok) throw new Error((role + " 调用失败: ") + (res && res.error || "unknown"));
+    if (!res || !res.ok) {
+      const err = new Error((role + " 调用失败: ") + (res && res.error || "unknown"));
+      // 引擎自己判定"再试也一样"的（权限、凭据、模型不存在），不该再烧掉五轮预算。
+      err.fatal = !!(res && res.fatal);
+      throw err;
+    }
     return res;
   } finally {
     clearInterval(timer);

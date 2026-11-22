@@ -142,6 +142,25 @@ divzero    awaiting_human      1   477178   311 pass
 
 人工闭环也验过：approve → `merging` → `git merge --no-ff` → `done`，demo 仓库出现合并提交 `wb: merge 实现 src/slug.mjs ...`。
 
+### 打包后跑真任务（2026-11-22，app 内，同模型）
+
+在打包好的 `.app` 里跑（工作区 `/tmp/wb-real-ws`，凭据由 `cred import` 搬进工作区，不随包分发、不进仓库）：
+
+```
+任务                         状态             尝试 token     护栏    Verifier
+实现乘法、除法与除零报错      awaiting_human    1   409738   5/5 绿  pass（raised 空）
+diff: 3 files changed, 46 insertions(+)
+```
+
+这一轮撞上第四个坑，已兜住：
+
+| 坑 | 现象 | 兜法 |
+| --- | --- | --- |
+| 规划阶段 cwd 在 `.oc/scratch`，agent 去读目标仓库属于「目录外」 | opencode 自动拒绝权限（`PermissionRejectedError`），整轮只剩工具调用、正文 0 字、退出码 0 → 被当成「空产出」重试，57 秒烧掉 22.5 万 token 才 blocked | ① 生成 `<WB_OC_HOME>/permission-overlay.json` 只读放行工作区根目录（`OPENCODE_CONFIG`，用户自设则不覆盖；`/tmp` 与 `/private/tmp` 两种写法都放行，bash 工具会解析 realpath）② 权限拒绝归类为**确定性失败**，直接 blocked 不再重试（`classifyFailure`）③ 失败时原始事件落盘 `<WB_OC_HOME>/logs/fail-*.jsonl`（留最近 5 个），不重跑也能对着看 |
+
+判断「要不要重试」这件事本身也得有依据：同样是「没有正文」，权限拒绝重试一百次也一样，
+限流/偶发空回才值得再给一次机会 —— 这个区分现在写在 `classifyFailure` 里，有单测（`tests/opencode-failure.test.mjs`）。
+
 ## 桌面外壳（方案 2）
 
 打包后没有终端，所以**界面里能直接建任务**：顶部「＋ 新建任务」填一句话、目标仓库、token 预算，提交就走 `POST /api/tasks`，worker 自动开跑；页面上的工作区/内核/引擎路径来自 `GET /api/workspace`（用来一眼看出这次连的是哪个内核、哪个工作区）。

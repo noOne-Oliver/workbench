@@ -62,12 +62,30 @@ async function main() {
     process.stdout.write(JSON.stringify(w) + "\n");
     return;
   }
+  if (cmd === "cred") {
+    // 凭据只搬不打印：输出里永远只有文件种类和 provider 名字。
+    const { credentialStatus, importCredentials } = await import("./core/credentials.mjs");
+    const root = arg("dir", process.env.WB_ROOT || process.env.WB_WORKSPACE || process.cwd());
+    const sub = process.argv[3];
+    if (sub === "import") {
+      const from = arg("from");
+      if (!from) {
+        process.stdout.write("用法: cli.mjs cred import --from <已有 .oc 目录> [--dir <工作区>]\n");
+        process.exit(2);
+      }
+      const r = importCredentials(from, root);
+      process.stdout.write(JSON.stringify({ imported: r.copied, ocHome: r.ocHome, providerEnv: r.providerEnv, providers: r.providers }) + "\n");
+      return;
+    }
+    process.stdout.write(JSON.stringify(credentialStatus(root)) + "\n");
+    return;
+  }
   if (cmd === "serve") {
     const { startServer } = await import("./server/index.mjs");
     startServer();
     return;
   }
-  process.stdout.write("用法: cli.mjs <init|workspace|enqueue|status|rebuild|run|serve>\n");
+  process.stdout.write("用法: cli.mjs <init|workspace|cred|enqueue|status|rebuild|run|serve>\n");
 }
 
 main().catch((e) => { process.stderr.write(String(e && e.stack || e) + "\n"); process.exit(1); });

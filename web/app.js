@@ -116,7 +116,11 @@ async function loadWorkspace() {
     const r = await api("/api/workspace");
     const w = await r.json();
     const info = el("ws-info");
-    if (info) info.textContent = "工作区 " + w.root + " · 内核 " + w.code + " · 引擎 " + w.engine;
+    if (info) {
+      const c = w.credentials || {};
+      const cred = w.engine === "mock" ? "假引擎" : (c.providerEnv ? "凭据已就位" + (c.providers && c.providers.length ? "（" + c.providers.join(", ") + "）" : "") : "缺凭据：把 provider.env 放进 " + (w.ocHome || "工作区/.oc") + "/private/");
+      info.textContent = "工作区 " + w.root + " · 内核 " + w.code + " · 引擎 " + w.engine + " · " + cred;
+    }
     const repo = el("t-repo");
     if (repo && !repo.value) repo.value = w.starterRepo;
   } catch { /* 老内核没有这个接口，忽略 */ }

@@ -284,6 +284,10 @@ enum WorkspaceProvisioner {
         env["WB_ROOT"] = workspace.path
         env["WB_CODE"] = paths.root.path
         env["WB_DB"] = workspace.appendingPathComponent("data/ledger.db").path
+        // 真引擎的凭据/配置属于工作区，不属于 app 包：显式指过去（外部已设 WB_OC_HOME 时听外部的）。
+        if env["WB_OC_HOME"] == nil || env["WB_OC_HOME"]!.isEmpty {
+            env["WB_OC_HOME"] = workspace.appendingPathComponent(".oc").path
+        }
 
         // 打包的 node 在 kernel/ 里：放进 PATH，护栏退回的 node --test 才能直接找到它。
         var parts = [paths.root.path, paths.node.deletingLastPathComponent().path]

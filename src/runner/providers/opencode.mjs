@@ -27,7 +27,11 @@ const FATAL_PATTERNS = [
 
 export default async function createOpencode(opts = {}) {
   const model = opts.model || process.env.WB_MODEL || null;
-  const home = path.resolve(opts.home || process.env.WB_OC_HOME || path.join(process.cwd(), ".oc"));
+  // 顺序：显式 opts.home → WB_OC_HOME → <WB_ROOT>/.oc → <cwd>/.oc。
+  // 打包成 app 后 cwd 是包内 kernel/，只有落到工作区才读得到凭据。
+  const home = path.resolve(
+    opts.home || process.env.WB_OC_HOME || path.join(process.env.WB_ROOT || process.cwd(), ".oc"),
+  );
   return {
     name: "opencode",
     async run({ prompt, cwd, timeoutMs, idleMs }) {
@@ -53,6 +57,12 @@ function execOpencode(args, cwd, { timeoutMs, idleMs, home, model }) {
       XDG_CACHE_HOME: path.join(home, "cache"),
       XDG_STATE_HOME: path.join(home, "state"),
     };
+    // 规划阶段的 cwd 是临时目录，agent 想读目标仓库就是"目录外"，
+    // 实测会被 opencode 自动拒绝（PermissionRejectedError），然后整轮只剩工具调用、
+    // 一个字的正文都没有 —— 表现成"空产出"，白烧一整轮 token。
+    // 这里用一层只读放行的配置把工作区根目录划进来；用户自己设了 OPENCODE_CONFIG 就不动。
+    const overlay = process.env.OPENCODE_CONFIG ? null : ensureOverlay(home);
+    if (overlay) env.OPENCODE_CONFIG = overlay;
     const p = spawn("opencode", args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
 
     let out = "";
@@ -141,14 +151,37 @@ function execOpencode(args, cwd, { timeoutMs, idleMs, home, model }) {
       const text = parsed.text || "";
       const tokens = parsed.tokens || estimate(text);
       if (code !== 0) {
+        saveFailLog(home, out);
         return finish({ ok: false, error: "exit " + code + ": " + String(out).slice(-600), text, tokens });
       }
       if (!text.trim()) {
-        return finish({ ok: false, error: "空产出：exit 0 但没有任何文本（多半是被限流或模型空回）", text: "", tokens });
+        saveFailLog(home, out);
+        const bad = classifyFailure(out);
+        return finish({ ok: false, fatal: !!(bad && bad.fatal), error: bad ? bad.error : "空产出", text: "", tokens });
       }
       finish({ ok: true, text, tokens });
     });
   });
+}
+
+/**
+ * 没有正文时，判断这次失败要不要重试。
+ * 规律（2026-11-22 实测）：opencode 一旦在工具上被权限拒绝，就让整轮结束在 tool-calls，
+ * 正文一个字都不给，退出码还是 0 —— 上层如果当"空产出"重试，会把同样一幕再烧五遍钱。
+ */
+export function classifyFailure(raw) {
+  const parsed = parseEvents(raw);
+  if (String(parsed.text || "").trim()) return null;
+  if (parsed.rejectedTool) {
+    return {
+      fatal: true,
+      error: "引擎拒绝了文件访问（" + parsed.rejectedTool + "）：external_directory 权限拦住了工作区外的读写。",
+    };
+  }
+  const why = parsed.lastReason
+    ? "step-finish reason=" + parsed.lastReason + "，最后一轮只有工具调用没有正文"
+    : "没有拿到任何 text 事件";
+  return { fatal: false, error: "空产出：exit 0 但没有任何文本（" + why + "）" };
 }
 
 /** 从一行（可能就是错误事件的最后一行）里认出"已经废了"的原因。 */
@@ -178,6 +211,8 @@ function fatalFromLine(line) {
 function parseEvents(raw) {
   let text = "";
   let tokens = 0;
+  let lastReason = null;
+  let rejectedTool = null;
   for (const line of String(raw).split("\n")) {
     const s = line.trim();
     if (s.charAt(0) !== "{") continue;
@@ -187,13 +222,65 @@ function parseEvents(raw) {
     const part = ev.part || {};
     const cand = [part.text, ev.text, ev.content, part.content];
     for (const t of cand) if (typeof t === "string" && t) text += t;
+    // 工具被权限拒绝时 opencode 只把错误塞在 tool part 的 state.error 里，正文一个字都不给。
+    if (part.type === "tool" && part.state && part.state.status === "error") {
+      const err = String(part.state.error || "");
+      if (/PermissionRejected|permission/i.test(err)) {
+        rejectedTool = String(part.tool || "tool") + " " + JSON.stringify(part.state.input || {});
+      }
+    }
+    if (part.type === "step-finish" && part.reason) lastReason = part.reason;
     const u = ev.usage || part.tokens;
     if (u) {
       const total = u.total || ((u.input_tokens || u.input || 0) + (u.output_tokens || u.output || 0));
       tokens += total;
     }
   }
-  return { text, tokens };
+  return { text, tokens, lastReason, rejectedTool };
+}
+
+/** 失败时把原始事件落盘：万一是引擎事件形状变了，还能离线对着看，不用重跑烧钱。 */
+function saveFailLog(home, raw) {
+  try {
+    const dir = path.join(home, "logs");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "fail-" + new Date().toISOString().replace(/[:.]/g, "-") + ".jsonl");
+    fs.writeFileSync(file, String(raw).slice(-200000));
+    const old = fs.readdirSync(dir).filter((f) => f.startsWith("fail-")).sort();
+    for (const f of old.slice(0, Math.max(0, old.length - 5))) fs.rmSync(path.join(dir, f), { force: true });
+  } catch { /* 日志写不下去不影响主流程 */ }
+}
+
+/**
+ * 只读放行"工作区根目录"的覆盖配置：规划阶段 cwd 在 .oc/scratch 下，
+ * 目标仓库在 <root>/demo 之类的位置，不划进来的话 agent 一读就被拒。
+ * 实测（2026-11-22）：拒绝之后整轮只剩工具调用、正文为空，表现成"空产出"。
+ */
+export function ensureOverlay(home) {
+  const root = path.resolve(process.env.WB_ROOT || process.cwd());
+  const scratch = path.join(home, "scratch");
+  // bash 工具会把路径解析成 realpath（macOS 上 /tmp → /private/tmp），
+  // 只放行 /tmp/... 的话 bash 那条路照样被拒。两个写法都给。
+  const dirs = new Set([root, scratch]);
+  for (const d of [root, scratch]) {
+    try { dirs.add(fs.realpathSync(d)); } catch { /* 目录还不存在就算了 */ }
+  }
+  const file = path.join(home, "permission-overlay.json");
+  const cfg = {
+    $schema: "https://opencode.ai/config.json",
+    permission: {
+      external_directory: Object.fromEntries([...dirs].map((d) => [d + "/*", "allow"])),
+    },
+  };
+  const body = JSON.stringify(cfg, null, 2) + "\n";
+  try {
+    let cur = "";
+    try { cur = fs.readFileSync(file, "utf8"); } catch { /* 第一次写 */ }
+    if (cur !== body) fs.writeFileSync(file, body);
+    return file;
+  } catch {
+    return null;   // 写不进去就退回原行为，至少不阻断运行
+  }
 }
 
 /** 本机凭据只从 .oc/private/provider.env 读，绝不进仓库；已存在的环境变量优先。 */

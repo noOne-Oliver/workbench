@@ -48,10 +48,14 @@ export function createApp(db) {
         return json(res, 200, { tasks: listTasks(db, { state: state || null }) });
       }
       if (req.method === "GET" && path === "/api/workspace") {
+        const { credentialStatus } = await import("../core/credentials.mjs");
+        const c = credentialStatus(ROOT);
         return json(res, 200, {
           root: ROOT, code: CODE,
           starterRepo: resolve(ROOT, "demo"),
           engine: process.env.WB_ENGINE || "mock",
+          ocHome: c.ocHome,
+          credentials: { providerEnv: c.providerEnv, providers: c.providers },
         });
       }
       if (req.method === "POST" && path === "/api/tasks") {
