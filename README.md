@@ -65,8 +65,10 @@ node src/cli.mjs status [--id <task>]              # 看任务与事件流
 node src/cli.mjs rebuild                           # 从事件全量重建投影（自愈）
 node src/cli.mjs run [--once] [--worker host:pid]  # 跑 worker
 node src/cli.mjs serve [--port 7317]               # 起审阅服务
+npm run web                                        # Web 版：起 server + worker（见「Web 版」一节）
+npm run web:status | web:logs | web:stop           # 看/跟/停
 npm run demo:reset                                 # 把 sandbox/demo 恢复到种子状态
-npm test                                           # 内核测试（状态机/账本/租约/预算/护栏）
+npm test                                           # 内核测试（状态机/账本/租约/预算/护栏/回归基线/登录）
 ```
 
 ## 环境变量
@@ -206,6 +208,73 @@ npm run verify:package -- --port 7641
 # PASS 离仓可运行 / 工作区正确 / worker 真跑 / SIGTERM 干净 / kill -9 无孤儿
 ```
 
+## Web 版（浏览器访问，不需要 .app）
+
+桌面外壳是「一个人的本机工具」；**Web 版是团队形态**：一台机器当 runner，其他人用浏览器访问同一个后台执行器。一条命令起服务：
+
+```bash
+npm run web                          # 默认 host 0.0.0.0、端口 7317、工作区 ~/Workbench
+node scripts/workbench.mjs start --port 7317 --workspace ~/Workbench
+```
+
+```text
+✓ 工作台已启动
+  工作区  /Users/liujie/Workbench
+  引擎    mock
+  进程    server=54675 worker=54676
+  日志    ~/Workbench/.wb/server.log · ~/Workbench/.wb/worker.log
+
+  本机    http://127.0.0.1:7321/
+  内网    http://192.168.31.35:7321/   （同一 Wi-Fi 下的人用这个）
+
+  口令    w56kq48XgqHK2YlD-aXXXnhq
+          首次启动生成，git 里没有；发给同事后自己留一份
+```
+
+### 口令与身份
+
+`WB_TOKEN` 是团队共用的**一个**口令（首次启动自动生成到 `<工作区>/.wb/token`，`600` 权限，不进仓库）。登录后发 `HttpOnly; SameSite=Lax` 的 cookie，7 天免密；页面和 API 一起挡住，没登录的人只会看到登录页。
+
+| 场景 | 怎么带 |
+| --- | --- |
+| 浏览器 | 登录页输口令 → cookie |
+| 脚本 / curl | `-H 'x-wb-token: <口令>'` |
+| 一次性链接 | `?token=<口令>`（发给同事点一下就能进，别贴到群里） |
+
+**reviewer 归属**：卡片上的「我是」写的是 `owner`，只有 owner 能裁决（服务端 403 兜住）。多人是共用一个口令，所以谁该看哪张卡靠 owner 字段约定——这是 v0 的取舍，不是忘了做。
+
+### 进程管理
+
+```bash
+npm run web          # start（已在跑就只打印地址，不会起第二份）
+npm run web:status   # 端口通不通、两个进程活着没、账本里各状态几个任务
+npm run web:logs     # 看 server + worker 日志（--follow 跟到底）
+npm run web:stop     # SIGTERM，8 秒不退再 SIGKILL
+```
+
+进程与状态都落在 `<工作区>/.wb/`（`server.pid`、`worker.pid`、两个 `.log`、`token`），所以重启机器后 `npm run web` 接着原来的账本跑。
+
+![Web 版登录页](docs/web-login.png)
+
+![Web 版 review 界面（右上角多了「退出」）](docs/web-review.png)
+
+### 和 .app 的关系
+
+| | 桌面 app | Web 版 |
+| --- | --- | --- |
+| 形态 | 双击打开的 .app，内核打包在里面 | 服务端进程 + 浏览器 |
+| 适合 | 一个人、本机 | 2~3 人、内网 |
+| 口令 | 不需要（只有本机能连） | 需要 |
+| 数据 | 同样在工作区 | 同样在工作区 |
+
+两者可以同时存在（不同端口、不同工作区）。**.app 不是被替换掉，Web 版也不依赖它**。
+
+### 安全边界（别踩）
+
+- 默认是 **HTTP 明文 + 单口令**：只适合内网/同一 Wi-Fi。要出公网，请套 Tailscale 或 nginx + HTTPS 反代，别直接端口映射。
+- 口令是团队共享的，服务端**不区分人**——审计靠事件里的 `actor`（`human.decision` 记 `by`），不是登录态。
+- 工作区里的 `.oc/private/provider.env` 是真模型凭据，别把工作区目录共享出去。
+
 ## 重试闭环（护栏 FAIL → 打回 → 重做 → 通过）
 
 「能自动执行」的核心不是模型一次写对，而是**写错了能不能自己回来**。`scripts/demo-retry.mjs` 就是这条链路的自动化验收：给 coder 加一层 `WB_FAULT=tautology` 的故障注入（`src/runner/providers/faulty.mjs`），在 **attempt 0** 把 `assert.equal(calc(2,3,'+'), 5)` 改写成 `assert.equal(calc(2,3,'+'), calc(2,3,'+'))`，然后看护栏能不能抓住、系统能不能自己重做。
@@ -318,6 +387,6 @@ src/server/   HTTP + 静态审阅界面
 web/          审阅收件箱（三栏：待裁决 / 后台在跑 / 归档 + 新建任务表单 + 按文件分组的 diff / 测试清单 / 全屏原始输出）
 sandbox/demo/ 演示用目标仓库（有真测试，能真跑）
 tests/        内核测试
-scripts/      demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）、打包复验（verify-package）
+scripts/      Web 版启动器（workbench）、demo 重置、重试闭环演示（demo-retry）、引擎体检（engine-smoke）、真引擎基准（bench）、打包复验（verify-package）
 apps/macshell/ macOS 桌面外壳（Swift + AppKit + WKWebView；内核打包进 app，离仓可运行）
 ```

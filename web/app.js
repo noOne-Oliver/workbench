@@ -1,8 +1,16 @@
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
-const api = (p, opts) => fetch(p, {
-  ...opts,
-  headers: { "content-type": "application/json", ...(TOKEN ? { "x-wb-token": TOKEN } : {}), ...(opts?.headers || {}) },
-});
+const api = (p, opts) =>
+  fetch(p, {
+    ...opts,
+    headers: { "content-type": "application/json", ...(TOKEN ? { "x-wb-token": TOKEN } : {}), ...(opts?.headers || {}) },
+  }).then((r) => {
+    // 服务端开了口令、cookie 又过期了：别在页面上显示一堆 401，直接回登录页
+    if (r.status === 401) {
+      location.replace("/login.html?next=" + encodeURIComponent(location.pathname + location.search));
+      throw new Error("unauthorized");
+    }
+    return r;
+  });
 
 const RUNNING = new Set(["queued", "planning", "implementing", "verifying", "reviewing", "merging"]);
 const LABEL = {
@@ -301,6 +309,10 @@ window.watch = function (id) {
   loadFeed();
 };
 window.clearFilter = function () { filterTask = null; feed = []; cursor = 0; loadFeed(); };
+window.logout = async function () {
+  await fetch("/api/logout", { method: "POST" });
+  location.replace("/login.html");
+};
 // 模块作用域的函数不会自动挂到 window 上，内联 onclick 找不到它们（这里显式导出）
 window.toggleCtx = toggleCtx;
 window.openRaw = openRaw;
@@ -340,6 +352,9 @@ async function loadWorkspace() {
     }
     const repo = el("t-repo");
     if (repo && !repo.value) repo.value = w.starterRepo;
+    // 开了口令才显示「退出」——本地单机用的时候不需要多一个按钮
+    const logout = el("logout");
+    if (logout && w.auth && w.auth.tokenRequired) logout.hidden = false;
   } catch { /* 老内核没有这个接口，忽略 */ }
 }
 

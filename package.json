@@ -9,6 +9,10 @@
   },
   "scripts": {
     "init": "node src/cli.mjs init",
+    "web": "node scripts/workbench.mjs start",
+    "web:stop": "node scripts/workbench.mjs stop",
+    "web:status": "node scripts/workbench.mjs status",
+    "web:logs": "node scripts/workbench.mjs logs",
     "serve": "node src/server/index.mjs",
     "worker": "node src/runner/worker.mjs",
     "enqueue": "node src/cli.mjs enqueue",

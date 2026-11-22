@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>工作台 · 登录</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0b0f14; color: #e6edf3;
+      font: 14px/1.6 -apple-system, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+    }
+    form { width: 340px; padding: 28px; border: 1px solid #1f2937; border-radius: 14px; background: #0f151c; }
+    h1 { margin: 0 0 4px; font-size: 17px; }
+    p.hint { margin: 0 0 20px; color: #8b949e; font-size: 12px; }
+    label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 6px; }
+    input {
+      width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid #263041;
+      background: #0b1118; color: #e6edf3; font: inherit;
+    }
+    input:focus { outline: none; border-color: #2f81f7; }
+    button {
+      width: 100%; margin-top: 14px; padding: 9px; border: 0; border-radius: 8px;
+      background: #2f81f7; color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: default; }
+    #msg { min-height: 18px; margin-top: 10px; font-size: 12px; color: #ffa198; }
+    code { color: #8b949e; }
+  </style>
+</head>
+<body>
+  <form id="login">
+    <h1>工作台</h1>
+    <p class="hint">团队共用口令；登录后 7 天内免密。口令在服务端的 <code>WB_TOKEN</code> 里。</p>
+    <label for="token">口令</label>
+    <input id="token" type="password" autocomplete="current-password" autofocus required />
+    <button id="go" type="submit">进入</button>
+    <div id="msg"></div>
+  </form>
+  <script>
+    const next = new URLSearchParams(location.search).get("next") || "/";
+    const msg = document.getElementById("msg");
+    document.getElementById("login").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const go = document.getElementById("go");
+      go.disabled = true;
+      msg.textContent = "";
+      try {
+        const r = await fetch("/api/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: document.getElementById("token").value }),
+        });
+        if (!r.ok) { msg.textContent = (await r.json()).error || "登录失败"; go.disabled = false; return; }
+        location.replace(next.startsWith("/") && !next.startsWith("//") ? next : "/");
+      } catch (err) {
+        msg.textContent = "连不上服务端：" + err;
+        go.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

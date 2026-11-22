@@ -24,10 +24,27 @@ function json(res, code, obj) {
   res.end(body);
 }
 
+const COOKIE = "wb_token";
+
+function cookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+/** 三种带法都认：cookie（浏览器登录后）、x-wb-token（脚本/外壳）、?token=（一次性链接）。 */
 function authed(req) {
   if (!TOKEN) return true;
-  const h = req.headers["x-wb-token"] || new URL(req.url, "http://x").searchParams.get("token");
-  return h === TOKEN;
+  const given = req.headers["x-wb-token"] || new URL(req.url, "http://x").searchParams.get("token") || cookies(req)[COOKIE] || "";
+  return given === TOKEN;
+}
+
+function setCookie(res, value, maxAge) {
+  res.setHeader("set-cookie", COOKIE + "=" + encodeURIComponent(value) + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + maxAge);
 }
 
 async function readBody(req) {
@@ -41,6 +58,19 @@ export function createApp(db) {
   return async function handler(req, res) {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname;
+
+    // 登录/登出自己不需要先登录（否则永远进不去）
+    if (path === "/api/login" && req.method === "POST") {
+      const b = await readBody(req);
+      if (!TOKEN) return json(res, 200, { ok: true, tokenRequired: false });
+      if (String(b.token || "") !== TOKEN) return json(res, 401, { error: "口令不对" });
+      setCookie(res, TOKEN, 7 * 24 * 3600);
+      return json(res, 200, { ok: true, tokenRequired: true });
+    }
+    if (path === "/api/logout" && req.method === "POST") {
+      setCookie(res, "", 0);
+      return json(res, 200, { ok: true });
+    }
 
     if (path.startsWith("/api/") && !authed(req)) return json(res, 401, { error: "unauthorized" });
 
@@ -71,6 +101,7 @@ export function createApp(db) {
           engine: process.env.WB_ENGINE || "mock",
           ocHome: c.ocHome,
           credentials: { providerEnv: c.providerEnv, providers: c.providers },
+          auth: { tokenRequired: !!TOKEN },
         });
       }
       if (req.method === "POST" && path === "/api/tasks") {
@@ -115,6 +146,11 @@ export function createApp(db) {
 
       if (req.method === "GET") {
         const rel = path === "/" ? "/index.html" : path;
+        // 开了口令时，页面也挡住：没登录的人只能看到登录页（静态资源同理，除了登录页自己）
+        if (TOKEN && !authed(req) && rel !== "/login.html") {
+          res.writeHead(302, { location: "/login.html", "cache-control": "no-store" });
+          return res.end();
+        }
         const file = join(WEB, rel.replace(/^\.\./, ""));
         if (!file.startsWith(WEB)) return json(res, 403, { error: "forbidden" });
         try {
