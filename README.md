@@ -5,9 +5,18 @@
 
 人只回答一个问题：**要不要合**。其余全部自动重试、自动升级、自动归档。
 
-## 下载安装（macOS）
+两种用法，同一份内核：
 
-**[下载 Workbench-0.2.0.zip](../../releases/latest)** · 11 MB · macOS 13+ / Apple Silicon · 内核（node + src + web）已在包内，**不需要另装 node**。
+| 用法 | 适合谁 | 怎么开始 |
+| --- | --- | --- |
+| **A. 桌面版（macOS app）** | 不想碰终端，双击就要用 | [下载 Workbench-0.2.0.zip](https://github.com/noOne-Oliver/workbench/releases/latest)（11 MB，macOS 13+ / Apple Silicon，内核已打包） |
+| **B. Web 版（浏览器）** | 有 node 的机器、想跑在服务器上 | 见下面「30 秒跑起来」，或 `node src/cli.mjs up` 一条命令起全套 |
+
+> 仓库分工：macOS 桌面版在 [noOne-Oliver/workbench](https://github.com/noOne-Oliver/workbench)，Web 版在 [noOne-Oliver/workbenchweb](https://github.com/noOne-Oliver/workbenchweb)。两边是同一套内核代码，差别只在分发方式。
+
+## A. 桌面版（macOS）
+
+**[下载 Workbench-0.2.0.zip](https://github.com/noOne-Oliver/workbench/releases/latest)** · 11 MB · macOS 13+ / Apple Silicon · 内核（node + src + web）已在包内，**不需要另装 node**。
 
 1. 解压，把 `Workbench.app` 拖进「应用程序」。
 2. 第一次打开必须**右键 → 打开**（没有苹果公证，双击会被 Gatekeeper 拦住）。也可以：`xattr -dr com.apple.quarantine /Applications/Workbench.app`
@@ -24,6 +33,17 @@ bash apps/macshell/build.sh      # → dist/Workbench.app（swiftc 编外壳 + �
 bash scripts/package-mac.sh      # → dist/Workbench-<版本>.zip（有 hdiutil 时同时出 .dmg）
 npm run verify:package           # 六断言：离仓可运行 / 工作区正确 / worker 真跑 / SIGTERM 干净 / kill -9 无孤儿 / worker 崩了自愈
 ```
+
+## B. Web 版（浏览器）
+
+不装 app，直接用 node 起内核：server + 看护着的 worker 一次拉起来，浏览器打开 `http://127.0.0.1:7317` 就是评审收件箱。
+
+```bash
+node src/cli.mjs workspace --dir ~/Workbench   # 第一次：建工作区（账本 + 起始仓库）
+WB_ROOT=~/Workbench node src/cli.mjs up        # 起内核（worker 崩了会自动重启）
+```
+
+要开机自启/常驻，交给 `launchd` 或 systemd 拉起同一条 `cli.mjs up` 即可；`GET /api/health` 会告诉你执行器是不是还活着。
 
 ## 30 秒跑起来
 
