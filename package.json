@@ -25,6 +25,7 @@
     "bench:real": "node scripts/bench-real.mjs --fresh",
     "shot:roles": "node scripts/shot-roles.mjs",
     "shots": "node scripts/shots.mjs",
+    "docs:diagrams": "node scripts/make-diagrams.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "build:mac": "bash apps/macshell/build.sh",
     "package:mac": "bash scripts/package-mac.sh",
